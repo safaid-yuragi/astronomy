@@ -1,0 +1,18 @@
+[package]
+name = "astronomy"
+version = "0.1.0"
+edition = "2021"
+description = "Astronomy IR — a language-agnostic, library-first intermediate representation with a verifier and a canonical text format (.arn)"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+
+# Astronomy Core has zero external dependencies by design (§56 Dependency Policy).
+[dependencies]
+
+[lib]
+name = "astronomy"
+path = "src/lib.rs"
+
+[[bin]]
+name = "astronomy"
+path = "src/bin/astronomy.rs"

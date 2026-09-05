@@ -1,0 +1,23 @@
+::ASTRONOMY::MODULE_START
+::ASTRONOMY::MODULE_NAME "hello"
+::ASTRONOMY::MODULE_VERSION 1
+
+# libc printf, described as a fact: signature + ABI.
+::ASTRONOMY::FUNCTION_START printf fn(ptr<i8>, ...) -> i32 linkage=external abi=c
+::ASTRONOMY::FUNCTION_END
+
+::ASTRONOMY::CONSTANTS_START
+::ASTRONOMY::CONSTANT_STRING c0 "Hello from Astronomy IR!\n"
+::ASTRONOMY::CONSTANT_INT c1 i32 42
+::ASTRONOMY::CONSTANTS_END
+
+::ASTRONOMY::FUNCTION_START hello fn() -> void linkage=exported abi=astronomy
+::ASTRONOMY::BLOCK_START entry
+%0 = ::ASTRONOMY::CONST ptr<i8> c0
+%1 = ::ASTRONOMY::CONST i32 c1
+%2 = ::ASTRONOMY::CALL i32 @printf(ptr<i8> %0, i32 %1)
+::ASTRONOMY::RETURN void
+::ASTRONOMY::BLOCK_END
+::ASTRONOMY::FUNCTION_END
+
+::ASTRONOMY::MODULE_END
