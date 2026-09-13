@@ -300,18 +300,37 @@ pub(crate) fn check_instruction(
                 check_result(inst, result_ty(inst), t, &type_name, errors, fname, "xor");
             }
         }
-        K::Shl { lhs, rhs } => {
-            if let Some(t) = same_type_pair!(lhs, rhs, "shl", |d: &TypeData| {
-                d.is_arith_integer()
-            }) {
-                check_result(inst, result_ty(inst), t, &type_name, errors, fname, "shl");
+        K::Shl { lhs, rhs } | K::Shr { lhs, rhs } => {
+            let op = if matches!(inst.kind, K::Shl { .. }) {
+                "shl"
+            } else {
+                "shr"
+            };
+            if let Some(lt) = operand_ty(*lhs) {
+                if !module
+                    .types()
+                    .get(lt)
+                    .map(|d| d.is_arith_integer())
+                    .unwrap_or(false)
+                {
+                    errors.push(bad_operand(format!(
+                        "{op} left operand in bb{block} must be an integer of at least 8 bits"
+                    )));
+                }
+                check_result(inst, result_ty(inst), lt, &type_name, errors, fname, op);
             }
-        }
-        K::Shr { lhs, rhs } => {
-            if let Some(t) = same_type_pair!(lhs, rhs, "shr", |d: &TypeData| {
-                d.is_arith_integer()
-            }) {
-                check_result(inst, result_ty(inst), t, &type_name, errors, fname, "shr");
+            if let Some(rt) = operand_ty(*rhs) {
+                if !module
+                    .types()
+                    .get(rt)
+                    .map(|d| d.is_integer())
+                    .unwrap_or(false)
+                {
+                    errors.push(bad_operand(format!(
+                        "{op} count in bb{block} must be an integer, found `{}`",
+                        type_name(rt)
+                    )));
+                }
             }
         }
         K::Eq { lhs, rhs } => {

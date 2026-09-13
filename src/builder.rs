@@ -541,11 +541,27 @@ impl<'m> FunctionBuilder<'m> {
     {
         let lt = self.ty_of(lhs)?;
         let rt = self.ty_of(rhs)?;
-        if lt != rt {
+        if lt != rt && class != BinClass::ArithIntShift {
             return Err(BuildError::TypeMismatch {
                 context: format!("{opname} operands"),
                 expected: self.type_name(lt),
                 found: self.type_name(rt),
+            });
+        }
+        if class == BinClass::ArithIntShift
+            && !self
+                .module
+                .types
+                .get(rt)
+                .map(|d| d.is_integer())
+                .unwrap_or(false)
+        {
+            return Err(BuildError::InvalidOperand {
+                context: opname,
+                reason: format!(
+                    "shift count must be an integer, found `{}`",
+                    self.type_name(rt)
+                ),
             });
         }
         let data = self.module.types.get(lt).cloned();
@@ -835,13 +851,14 @@ impl<'m> FunctionBuilder<'m> {
             InstructionKind::Xor { lhs: l, rhs: r }
         })
     }
-    /// Shift left.
+    /// Shift left; the count may have any integer type and is interpreted unsigned.
     pub fn shl(&mut self, lhs: ValueId, rhs: ValueId) -> Result<ValueId, BuildError> {
         self.binop(BinClass::ArithIntShift, "shl", lhs, rhs, |l, r| {
             InstructionKind::Shl { lhs: l, rhs: r }
         })
     }
     /// Shift right (arithmetic for signed operands, logical otherwise).
+    /// The count may have any integer type and is interpreted unsigned.
     pub fn shr(&mut self, lhs: ValueId, rhs: ValueId) -> Result<ValueId, BuildError> {
         self.binop(BinClass::ArithIntShift, "shr", lhs, rhs, |l, r| {
             InstructionKind::Shr { lhs: l, rhs: r }

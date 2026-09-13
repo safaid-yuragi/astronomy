@@ -16,3 +16,10 @@ path = "src/lib.rs"
 [[bin]]
 name = "astronomy"
 path = "src/bin/astronomy.rs"
+
+# Out-of-tree backends live in sibling crates and depend on `astronomy` by
+# path; the core crate keeps zero backend-specific code and zero external
+# dependencies (§56 Dependency Policy, §17 Non-goals).
+[workspace]
+members = ["astronomy-nasm"]
+resolver = "2"

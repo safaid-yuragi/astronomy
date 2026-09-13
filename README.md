@@ -166,6 +166,7 @@ prints as:
 astronomy/
 ├── Cargo.toml           # zero dependencies
 ├── SPECIFICATION.md     # semantics + .arn grammar
+├── USAGE.md             # library usage guide (build → verify → .arn)
 ├── src/
 │   ├── lib.rs           # public API re-exports
 │   ├── id.rs            # numeric ID newtypes
@@ -182,7 +183,8 @@ astronomy/
 │   ├── text/            # .arn lexer / parser / canonical printer
 │   └── bin/astronomy.rs # small dev CLI (verify/fmt/inspect)
 ├── examples/            # add, cfg, block_args, extern_decl
-└── tests/               # acceptance, negative, roundtrip suites
+├── tests/               # acceptance, negative, roundtrip suites
+└── astronomy-nasm/      # out-of-tree NASM (x86-64) native backend crate
 ```
 
 ## Development CLI
@@ -218,9 +220,14 @@ MVP complete per the prototype definition of done:
 - [x] `.arn` re-parse into an equivalent, verifying module
 - [x] Deterministic printing (snapshot- and cache-friendly)
 
-Future work (by design, not yet implemented): `.arb` binary format,
-optimizer passes, and out-of-tree backends (`astronomy-c`, `astronomy-llvm`,
-…) — the core crate intentionally has no backend-specific dependencies.
+One out-of-tree backend ships in this repository: **`astronomy-nasm`** — a
+NASM (x86-64, System V AMD64) native backend that lowers verified modules to
+assembly text (see [`astronomy-nasm/README.md`](astronomy-nasm/README.md)).
+It is a separate workspace member, so the core crate keeps zero backend code
+and zero backend dependencies.
+
+Future work (by design, not yet implemented): `.arb` binary format, optimizer
+passes, and further out-of-tree backends (`astronomy-c`, `astronomy-llvm`, …).
 
 ## License
 
