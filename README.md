@@ -37,6 +37,8 @@ inference.
 - **Verifying** — `Module → Verifier → VerifiedModule`; backends accept
   `&VerifiedModule` only.
 - **Canonical `.arn` text** — deterministic printing, stable roundtrips.
+- **Compact `.arb` binary** — lossless, deterministic, checksummed; the
+  reader treats input as untrusted.
 - **Zero dependencies** — the core crate has none.
 
 ## Quick start
@@ -137,6 +139,21 @@ let verified = Verifier::verify(b.finish())?;
 # }
 ```
 
+## Binary format (`.arb`)
+
+`.arb` stores the in-memory module directly — IDs, tables and arenas
+as-is — so it loads without parsing or name resolution:
+
+```rust
+let bytes = verified.to_arb();                  // Vec<u8>, deterministic
+let module = astronomy::Module::from_arb(&bytes)?;
+let verified = module.verify()?;                // decoding never skips this
+```
+
+Decoding is lossless (`from_arb(to_arb(m)) == m`, source spans aside),
+bounds-checked, CRC-32 protected and never panics on hostile input. The
+byte layout is specified in [SPECIFICATION.md §16](SPECIFICATION.md).
+
 ## External symbols (e.g. libc)
 
 Astronomy records the *fact* of an external function — signature and ABI —
@@ -181,9 +198,10 @@ astronomy/
 │   ├── builder.rs       # ModuleBuilder / FunctionBuilder
 │   ├── verify/          # verifier (ssa, types, cfg + dominance)
 │   ├── text/            # .arn lexer / parser / canonical printer
-│   └── bin/astronomy.rs # small dev CLI (verify/fmt/inspect)
+│   ├── binary/          # .arb reader / writer
+│   └── bin/astronomy.rs # small dev CLI (verify/fmt/inspect/encode)
 ├── examples/            # add, cfg, block_args, extern_decl
-├── tests/               # acceptance, negative, roundtrip suites
+├── tests/               # acceptance, negative, roundtrip, binary suites
 └── astronomy-nasm/      # out-of-tree NASM (x86-64) native backend crate
 ```
 
@@ -194,6 +212,8 @@ cargo run --quiet --example add          # build + verify + print .arn
 astronomy verify hello.arn               # parse + verify
 astronomy fmt    hello.arn               # parse + canonical print
 astronomy inspect hello.arn              # module summary
+astronomy encode hello.arn hello.arb     # write .arb binary
+astronomy fmt    hello.arb               # .arb → canonical .arn
 ```
 
 ## Error model
@@ -206,6 +226,7 @@ errors:
 | `A-BUILD` | builder rejected invalid construction     |
 | `A-VERIFY`| verifier rejected invalid IR              |
 | `A-ARN`   | `.arn` text could not be parsed           |
+| `A-ARB`   | `.arb` binary could not be decoded        |
 
 The verifier reports *all* errors it finds via `VerifyErrorReport`
 (iterable, `Display`-able, `std::error::Error`).
@@ -219,6 +240,7 @@ MVP complete per the prototype definition of done:
 - [x] Canonical `.arn` serialization
 - [x] `.arn` re-parse into an equivalent, verifying module
 - [x] Deterministic printing (snapshot- and cache-friendly)
+- [x] `.arb` binary format: lossless, deterministic, checksummed roundtrip
 
 One out-of-tree backend ships in this repository: **`astronomy-nasm`** — a
 NASM (x86-64, System V AMD64) native backend that lowers verified modules to
@@ -226,8 +248,8 @@ assembly text (see [`astronomy-nasm/README.md`](astronomy-nasm/README.md)).
 It is a separate workspace member, so the core crate keeps zero backend code
 and zero backend dependencies.
 
-Future work (by design, not yet implemented): `.arb` binary format, optimizer
-passes, and further out-of-tree backends (`astronomy-c`, `astronomy-llvm`, …).
+Future work (by design, not yet implemented): optimizer passes, and further
+out-of-tree backends (`astronomy-c`, `astronomy-llvm`, …).
 
 ## License
 

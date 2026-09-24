@@ -2,7 +2,7 @@
 
 This guide is for code (human- or agent-written) that consumes the
 `astronomy` crate **as a library**: building IR in memory, verifying it,
-and exchanging it as canonical `.arn` text. It complements
+and exchanging it as canonical `.arn` text or compact `.arb` binary. It complements
 [`README.md`](README.md) (overview) and [`SPECIFICATION.md`](SPECIFICATION.md)
 (normative semantics and the full `.arn` grammar).
 
@@ -314,6 +314,31 @@ Properties (normative in SPECIFICATION.md §13):
 * Strings escape `\n \t \r \0 \\ \"` and non-printables as `\xNN`; no
   trailing NUL is stored.
 
+### 7.1 Binary format (`.arb`)
+
+For caching and tool-to-tool exchange, use the binary encoding instead of
+text. It stores the module's tables and arenas directly, so IDs survive
+unchanged and loading involves no parsing:
+
+```rust
+let bytes: Vec<u8> = verified.to_arb();            // or astronomy::binary::write(&module)
+let module = Module::from_arb(&bytes)?;            // or astronomy::binary::read(&bytes)
+let verified = module.verify()?;                   // decoding does not verify
+if astronomy::binary::is_arb(&bytes) { /* sniff .arb vs .arn input */ }
+```
+
+Properties (normative in SPECIFICATION.md §16):
+
+* **Lossless**: `Module::from_arb(&m.to_arb()) == m`, including value and
+  block names, unverified modules and NaN payloads. Source spans are the
+  one exception — they describe `.arn` lines and are not stored.
+* **Deterministic**: equal modules encode to identical bytes.
+* **Safe on untrusted input**: every length is bounds-checked before
+  allocation, a CRC-32 footer catches corruption, and malformed input
+  yields a coded `ArbError` (with `.offset()`), never a panic.
+* The reader checks structure only; run the verifier before a backend, as
+  with parsed `.arn`.
+
 ## 8. Inspecting IR programmatically
 
 `Module` (and `VerifiedModule` via `Deref`) exposes read access:
@@ -353,6 +378,7 @@ errors. Each variant has a `.code()` method and implements
 | `A-BUILD-*` | `BuildError` (`.code()`: `A-BUILD-001`…`019`) | builder rejected invalid construction (unknown value/block/function, type mismatch, double terminator, invalid/reserved names, duplicate function, no current block, invalid signature, …) |
 | `A-VERIFY-*` | `VerifyError` (collected in `VerifyErrorReport`; codes `A-VERIFY-001`…`073`) | verifier rejected invalid IR |
 | `A-ARN-*` | `ParseError` (codes `A-ARN-001`…`021`; `.line()` gives the source line when known) | `.arn` text could not be parsed |
+| `A-ARB-*` | `ArbError` (codes `A-ARB-001`…`012`; `.offset()` gives the byte offset when known) | `.arb` binary could not be decoded |
 
 Match on variants (they carry IDs/names/reasons) to emit your own
 diagnostics; use `.code()` for stable, greppable tags in logs and tests.
@@ -408,6 +434,8 @@ cargo run -- --help
 astronomy verify  hello.arn              # parse + verify
 astronomy fmt    hello.arn               # parse + canonical print
 astronomy inspect hello.arn              # module summary
+astronomy encode hello.arn hello.arb     # write .arb binary
+astronomy fmt    hello.arb               # every command also reads .arb
 ```
 
 Runnable library examples live in `examples/` (`add`, `cfg`,
@@ -416,7 +444,7 @@ Runnable library examples live in `examples/` (`add`, `cfg`,
 
 ## 13. Not in the MVP (by design)
 
-`.arb` binary format, optimizer passes, global variables and metadata
+Optimizer passes, global variables and metadata
 (`GlobalId`/`MetadataId` are reserved), vector/opaque/union types,
 indirect calls, aliasing/alignment metadata, and out-of-tree backends.
 The core crate has zero dependencies and no backend-specific code.

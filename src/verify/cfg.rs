@@ -152,7 +152,7 @@ fn use_pos(f: &Function, block: usize) -> u32 {
 fn def_pos(value: &ValueKind) -> Option<(BlockId, u32)> {
     match value {
         ValueKind::BlockParam { block, .. } => Some((*block, 0)),
-        ValueKind::Inst { block, index } => Some((*block, index + 1)),
+        ValueKind::Inst { block, index } => Some((*block, index.saturating_add(1))),
         ValueKind::Param { .. } | ValueKind::Reserved => None,
     }
 }
@@ -186,10 +186,14 @@ impl<'a> UseChecker<'a> {
 
         // Uses inside unreachable blocks are not checked (the block is dead
         // and may legally appear in any textual order, §34).
-        if !self.info.reachable[ub] {
+        // Out-of-range blocks are reported by the SSA definition checks.
+        if !self.info.reachable.get(ub).copied().unwrap_or(false) {
             return;
         }
-        if !self.info.reachable[db] {
+        let Some(&def_reachable) = self.info.reachable.get(db) else {
+            return;
+        };
+        if !def_reachable {
             self.errors.push(VerifyError::UseNotDominated {
                 function: self.fname.to_string(),
                 value: v.as_u32(),

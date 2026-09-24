@@ -5,7 +5,8 @@ Version 1.0 — normative for the `astronomy` crate MVP.
 Astronomy is a language-agnostic intermediate representation library.
 Frontends lower *resolved* programs into Astronomy; backends consume only
 *verified* Astronomy. This document defines the core IR model, its
-semantics, the verification rules and the `.arn` textual format.
+semantics, the verification rules, the `.arn` textual format and the
+`.arb` binary format.
 
 ---
 
@@ -75,7 +76,9 @@ Frontend → ModuleBuilder (Rust API) → Module → Verifier → VerifiedModule
                             (debug / snapshots / exchange only)
 ```
 
-`.arn` text is never on the hot path of compilation.
+`.arn` text is never on the hot path of compilation. `.arb` (§16) is the
+compact binary encoding of the same module, for caching and exchange
+between tools; like `.arn`, decoded modules must be verified before use.
 
 ## 3. Types
 
@@ -406,9 +409,10 @@ unknown major versions (`A-ARN-001`). Minor versions are additive.
 | A-BUILD-001…| builder rejected invalid construction       |
 | A-VERIFY-001…| verifier rejected invalid IR               |
 | A-ARN-001…  | `.arn` parse failure (with source line)     |
+| A-ARB-001…  | `.arb` decode failure (with byte offset)    |
 
 Errors are data-carrying enums (`BuildError`, `VerifyError`,
-`ParseError`), never strings. The verifier returns a `VerifyErrorReport`
+`ParseError`, `ArbError`), never strings. The verifier returns a `VerifyErrorReport`
 listing every problem found.
 
 ## 15. Determinism and performance
@@ -423,20 +427,137 @@ listing every problem found.
   verify/optimize/codegen by the *consumer* — the library itself spawns no
   threads.
 
-## 16. Binary format (future, non-normative)
+## 16. Binary format (`.arb`)
 
-`.arb` will mirror the in-memory layout for fast load with minimal
-allocation:
+`.arb` is the compact, fast-loading counterpart of `.arn`. It serializes
+the in-memory `Module` directly: every numeric ID (type, symbol, constant,
+function, value, block) is stored as-is, so decoding rebuilds the same
+arenas with no name resolution or renumbering.
 
-```text
-Header | TypeTable | SymbolTable | ConstantTable | GlobalTable
-      | FunctionTable | BlockTable | InstructionTable
-      | MetadataTable | StringTable
+```rust
+let bytes: Vec<u8> = module.to_arb();          // astronomy::binary::write
+let module = Module::from_arb(&bytes)?;        // astronomy::binary::read
+let verified = module.verify()?;               // decoding does not verify
 ```
 
-The MVP's numeric IDs, interned tables and contiguous storage are chosen
-specifically so this is a serialization exercise, not a redesign. An
-mmap-able layout may follow; it is explicitly out of scope today.
+Guarantees:
+
+* **Lossless.** `read(write(m)) == m` for any module (verified or not)
+  whose nodes carry no spans. Spans refer to `.arn` source lines and are
+  not semantic (§43), so they are not stored.
+* **Deterministic.** Output depends only on arena order; equal modules
+  encode to identical bytes, and `write(read(b)) == b` for any `b` the
+  writer produced.
+* **Untrusted input.** The reader never panics and checks every list
+  length against the bytes that remain before allocating. It enforces
+  *structure* (framing, tags, checksum, table invariants below); all
+  *semantic* checks remain the verifier's job, exactly as for `.arn`.
+
+### 16.1 Encoding
+
+All integers are little-endian, fixed width. Conventions used below:
+
+| Notation   | Encoding                                              |
+|------------|-------------------------------------------------------|
+| `u8/u16/u32/u64/u128` | fixed-width little-endian                  |
+| `bool`     | `u8`, exactly `0` or `1`                              |
+| `opt<u32>` | `u8` flag (`0` absent, `1` present) then `u32` if present |
+| `list<T>`  | `u32` count, then that many `T`                       |
+| `bytes`    | `u32` length, then raw bytes                          |
+| `id`       | `u32` raw index (`TypeId`, `SymbolId`, …)             |
+
+### 16.2 File layout
+
+```text
+Header   magic   7F 41 52 42 0D 0A 1A 0A   ("\x7FARB\r\n\x1A\n")
+         u16     format major   (currently 1; readers reject others)
+         u16     format minor   (currently 0; additive)
+         u32     flags          (reserved, must be 0)
+Section  MODL | SYMB | TYPE | CNST | FUNC     (all mandatory, this order)
+Footer   u32     CRC-32 (IEEE, as zlib/PNG) of every preceding byte
+```
+
+Each section is `tag: [u8; 4]`, `length: u64`, then exactly `length` body
+bytes. Unknown, missing or reordered sections are rejected (`A-ARB-006`);
+a body that is not consumed exactly is rejected (`A-ARB-007`).
+
+| Section | Body |
+|---------|------|
+| `MODL`  | `u32` IR major (must be 1, see §13.4), `u32` IR minor, `opt<u32>` name symbol |
+| `SYMB`  | `list<bytes>` — UTF-8 names in `SymbolId` order |
+| `TYPE`  | `list<type>` — all types in `TypeId` order, including the 14 scalars |
+| `CNST`  | `list<constant>` — the pool in `ConstantId` order |
+| `FUNC`  | `list<function>` — in `FunctionId` order |
+
+```text
+type      = u8 tag, payload
+  0 void
+  1 int       u32 bits, bool signed
+  2 float     u8 kind (0 = f32, 1 = f64)
+  3 pointer   id pointee, u32 address_space
+  4 array     id element, u64 length
+  5 struct    list<id> fields
+  6 function  list<id> params, bool variadic, id result
+
+constant  = u8 tag, payload
+  0 int       id type, u32 width, u128 bits (masked to width)
+  1 float     id type, u64 bits
+  2 null      id pointee
+  3 string    bytes (no trailing NUL)
+  4 aggregate id type, list<id> elements
+
+function  = id symbol, u8 linkage (0 internal, 1 external, 2 exported),
+            u8 abi (0 astronomy, 1 c, 2 system, 3 custom + id symbol),
+            bool variadic, id result,
+            list<(id value, id type)> params,
+            list<value> values, list<block> blocks
+value     = id type, u8 kind, payload, opt<u32> name symbol
+  kind: 0 reserved | 1 param u32 index
+      | 2 block_param id block, u32 index | 3 inst id block, u32 index
+block     = opt<u32> name symbol, list<(id value, id type)> params,
+            list<instruction> instructions, terminator
+terminator = u8 tag, payload
+  0 none (incomplete block) | 1 jump id target, list<id> args
+  2 branch id cond, id then, list<id> then_args, id else, list<id> else_args
+  3 return opt<u32> value | 4 unreachable
+instruction = u8 opcode, operands, opt<u32> result value
+```
+
+| Opcode | Instruction | Operands |
+|--------|-------------|----------|
+| `0x00` | `const` | id constant |
+| `0x01`–`0x05` | `add sub mul div rem` | id lhs, id rhs |
+| `0x06`–`0x0A` | `and or xor shl shr` | id lhs, id rhs |
+| `0x0B`–`0x10` | `eq ne lt le gt ge` | id lhs, id rhs |
+| `0x11` | `alloca` | id pointee type |
+| `0x12` | `load` | id type, id pointer |
+| `0x13` | `store` | id pointer, id value |
+| `0x14` | `ptr_offset` | id pointer, id offset |
+| `0x15`–`0x18` | `ext trunc int_to_float float_to_int` | id to-type, id value |
+| `0x19` | `ptr_cast` | id to-type, id pointer |
+| `0x1A` | `call` | id callee function, list<id> args |
+| `0x1B` | `construct` | id type, list<id> fields |
+| `0x1C` | `extract` | id aggregate, u32 index |
+| `0x1D` | `insert` | id aggregate, u32 index, id value |
+
+### 16.3 Reader invariants
+
+Beyond framing, the reader enforces only what the in-memory tables rely
+on, so a decoded `Module` is always well-formed as a data structure:
+
+* symbols, types and constants contain no duplicates (`A-ARB-010`) — the
+  stores are interning tables;
+* type entries 0–13 are exactly the pre-interned scalars (§3);
+* a type entry references only *earlier* type entries (`A-ARB-011`),
+  keeping the table acyclic; integer widths are 1–128 and `i1` is
+  unsigned;
+* integer constants are masked to their width;
+* every symbol reference (module name, function, custom ABI, value and
+  block names) is in range.
+
+Value, block, function and constant references, typing, SSA and
+dominance are **not** checked by the reader; `Module::verify` reports
+them as for any other module.
 
 ## 17. Non-goals (MVP)
 

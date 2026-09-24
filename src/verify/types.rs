@@ -602,7 +602,7 @@ pub(crate) fn check_instruction(
             let expected = aggregate_fields(module, *ty);
             match expected {
                 Some(expected) => {
-                    if expected.len() != fields.len() {
+                    if expected.len() != fields.len() as u64 {
                         errors.push(bad_operand(format!(
                             "construct of `{}` in bb{block} needs {} field(s), found {}",
                             type_name(*ty),
@@ -610,7 +610,10 @@ pub(crate) fn check_instruction(
                             fields.len()
                         )));
                     }
-                    for (i, (&field, &want)) in fields.iter().zip(expected.iter()).enumerate() {
+                    for (i, &field) in fields.iter().enumerate() {
+                        let Some(want) = expected.get(i as u64) else {
+                            break;
+                        };
                         if let Some(actual) = operand_ty(field) {
                             if actual != want {
                                 errors.push(mismatch(
@@ -640,8 +643,8 @@ pub(crate) fn check_instruction(
         K::Extract { aggregate, index } => {
             let fields = operand_ty(*aggregate).and_then(|t| aggregate_fields(module, t));
             match fields {
-                Some(fields) => match fields.get(*index as usize) {
-                    Some(&field) => check_result(
+                Some(fields) => match fields.get(u64::from(*index)) {
+                    Some(field) => check_result(
                         inst,
                         result_ty(inst),
                         field,
@@ -668,8 +671,8 @@ pub(crate) fn check_instruction(
             match fields {
                 Some(fields) => {
                     let aty = operand_ty(*aggregate).unwrap();
-                    match fields.get(*index as usize) {
-                        Some(&field) => {
+                    match fields.get(u64::from(*index)) {
+                        Some(field) => {
                             if let Some(actual) = operand_ty(*value) {
                                 if actual != field {
                                     errors.push(mismatch(
@@ -739,10 +742,38 @@ fn check_result(
     }
 }
 
-fn aggregate_fields(module: &Module, ty: TypeId) -> Option<Vec<TypeId>> {
+/// Field types of an aggregate, without materializing array elements: an
+/// array length is untrusted input and may be astronomically large.
+enum AggregateFields<'a> {
+    Array { element: TypeId, length: u64 },
+    Struct(&'a [TypeId]),
+}
+
+impl AggregateFields<'_> {
+    fn len(&self) -> u64 {
+        match self {
+            AggregateFields::Array { length, .. } => *length,
+            AggregateFields::Struct(fields) => fields.len() as u64,
+        }
+    }
+
+    fn get(&self, index: u64) -> Option<TypeId> {
+        match self {
+            AggregateFields::Array { element, length } => (index < *length).then_some(*element),
+            AggregateFields::Struct(fields) => {
+                usize::try_from(index).ok().and_then(|i| fields.get(i).copied())
+            }
+        }
+    }
+}
+
+fn aggregate_fields(module: &Module, ty: TypeId) -> Option<AggregateFields<'_>> {
     match module.types().get(ty) {
-        Some(TypeData::Array { element, length }) => Some(vec![*element; *length as usize]),
-        Some(TypeData::Struct { fields }) => Some(fields.clone()),
+        Some(TypeData::Array { element, length }) => Some(AggregateFields::Array {
+            element: *element,
+            length: *length,
+        }),
+        Some(TypeData::Struct { fields }) => Some(AggregateFields::Struct(fields)),
         _ => None,
     }
 }

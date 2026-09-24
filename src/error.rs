@@ -1004,6 +1004,205 @@ impl fmt::Display for ParseError {
 impl std::error::Error for ParseError {}
 
 // ---------------------------------------------------------------------------
+// ARB binary errors (A-ARB-*)
+// ---------------------------------------------------------------------------
+
+/// Errors produced when decoding `.arb` binary data.
+///
+/// Every variant that concerns a specific location carries the absolute
+/// byte `offset` into the input at which the problem was detected.
+#[allow(missing_docs)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArbError {
+    /// The input does not start with the `.arb` magic bytes (`A-ARB-001`).
+    BadMagic,
+    /// Unsupported `.arb` container format version (`A-ARB-002`).
+    UnsupportedFormatVersion {
+        /// The major format version that was found.
+        found: u16,
+        /// The major format version this library supports.
+        supported: u16,
+    },
+    /// Unsupported module IR version (`A-ARB-003`).
+    UnsupportedVersion {
+        /// Offset of the version field.
+        offset: usize,
+        /// The major IR version that was found.
+        found: u32,
+        /// The major IR version this library supports.
+        supported: u32,
+    },
+    /// Input ended before a complete field could be read (`A-ARB-004`).
+    UnexpectedEof {
+        /// Offset at which more data was needed.
+        offset: usize,
+        /// What was being read.
+        what: &'static str,
+    },
+    /// The trailing CRC-32 does not match the content (`A-ARB-005`).
+    ChecksumMismatch {
+        /// Checksum stored in the file.
+        stored: u32,
+        /// Checksum computed over the content.
+        computed: u32,
+    },
+    /// A section header is missing, out of order or unknown (`A-ARB-006`).
+    UnexpectedSection {
+        /// Offset of the section header.
+        offset: usize,
+        /// The section tag that was expected.
+        expected: String,
+        /// The section tag that was found.
+        found: String,
+    },
+    /// A section's declared length does not match its content (`A-ARB-007`).
+    SectionLength {
+        /// Offset of the section header.
+        offset: usize,
+        /// Section tag.
+        section: String,
+        /// Human-readable reason.
+        reason: String,
+    },
+    /// An enum discriminant (type kind, opcode, linkage, ...) is unknown
+    /// (`A-ARB-008`).
+    InvalidTag {
+        /// Offset of the tag byte.
+        offset: usize,
+        /// What kind of tag was being decoded.
+        what: &'static str,
+        /// The tag value found.
+        tag: u8,
+    },
+    /// A field holds a value outside its allowed range (`A-ARB-009`).
+    InvalidValue {
+        /// Offset of the field.
+        offset: usize,
+        /// Human-readable reason.
+        reason: String,
+    },
+    /// An interned table contains the same entry twice (`A-ARB-010`).
+    DuplicateEntry {
+        /// Offset of the entry.
+        offset: usize,
+        /// Table name (`symbol`, `type`, `constant`).
+        table: &'static str,
+        /// Index of the duplicate entry.
+        index: u32,
+    },
+    /// A type table entry references itself or a later entry (`A-ARB-011`).
+    ForwardTypeReference {
+        /// Offset of the entry.
+        offset: usize,
+        /// Index of the entry.
+        index: u32,
+        /// The referenced type index.
+        referenced: u32,
+    },
+    /// Bytes remain between the last section and the checksum
+    /// (`A-ARB-012`).
+    TrailingBytes {
+        /// Offset of the first unexpected byte.
+        offset: usize,
+    },
+}
+
+impl ArbError {
+    /// Stable error code (e.g. `A-ARB-001`).
+    pub fn code(&self) -> &'static str {
+        match self {
+            ArbError::BadMagic => "A-ARB-001",
+            ArbError::UnsupportedFormatVersion { .. } => "A-ARB-002",
+            ArbError::UnsupportedVersion { .. } => "A-ARB-003",
+            ArbError::UnexpectedEof { .. } => "A-ARB-004",
+            ArbError::ChecksumMismatch { .. } => "A-ARB-005",
+            ArbError::UnexpectedSection { .. } => "A-ARB-006",
+            ArbError::SectionLength { .. } => "A-ARB-007",
+            ArbError::InvalidTag { .. } => "A-ARB-008",
+            ArbError::InvalidValue { .. } => "A-ARB-009",
+            ArbError::DuplicateEntry { .. } => "A-ARB-010",
+            ArbError::ForwardTypeReference { .. } => "A-ARB-011",
+            ArbError::TrailingBytes { .. } => "A-ARB-012",
+        }
+    }
+
+    /// Byte offset of the problem, when the error concerns one location.
+    pub fn offset(&self) -> Option<usize> {
+        match self {
+            ArbError::UnsupportedVersion { offset, .. }
+            | ArbError::UnexpectedEof { offset, .. }
+            | ArbError::UnexpectedSection { offset, .. }
+            | ArbError::SectionLength { offset, .. }
+            | ArbError::InvalidTag { offset, .. }
+            | ArbError::InvalidValue { offset, .. }
+            | ArbError::DuplicateEntry { offset, .. }
+            | ArbError::ForwardTypeReference { offset, .. }
+            | ArbError::TrailingBytes { offset } => Some(*offset),
+            ArbError::BadMagic
+            | ArbError::UnsupportedFormatVersion { .. }
+            | ArbError::ChecksumMismatch { .. } => None,
+        }
+    }
+}
+
+impl fmt::Display for ArbError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let msg = match self {
+            ArbError::BadMagic => "not an .arb file (bad magic bytes)".to_string(),
+            ArbError::UnsupportedFormatVersion { found, supported } => format!(
+                "unsupported .arb format version {found} (supported: {supported})"
+            ),
+            ArbError::UnsupportedVersion {
+                offset,
+                found,
+                supported,
+            } => format!(
+                "offset {offset}: unsupported module version {found} (supported: {supported})"
+            ),
+            ArbError::UnexpectedEof { offset, what } => {
+                format!("offset {offset}: unexpected end of data while reading {what}")
+            }
+            ArbError::ChecksumMismatch { stored, computed } => format!(
+                "checksum mismatch: stored {stored:#010x}, computed {computed:#010x}"
+            ),
+            ArbError::UnexpectedSection {
+                offset,
+                expected,
+                found,
+            } => format!("offset {offset}: expected section `{expected}`, found `{found}`"),
+            ArbError::SectionLength {
+                offset,
+                section,
+                reason,
+            } => format!("offset {offset}: section `{section}`: {reason}"),
+            ArbError::InvalidTag { offset, what, tag } => {
+                format!("offset {offset}: invalid {what} tag {tag:#04x}")
+            }
+            ArbError::InvalidValue { offset, reason } => format!("offset {offset}: {reason}"),
+            ArbError::DuplicateEntry {
+                offset,
+                table,
+                index,
+            } => format!("offset {offset}: {table} entry {index} duplicates an earlier entry"),
+            ArbError::ForwardTypeReference {
+                offset,
+                index,
+                referenced,
+            } => format!(
+                "offset {offset}: type {index} references type {referenced}; \
+                 type entries may only reference earlier entries"
+            ),
+            ArbError::TrailingBytes { offset } => {
+                format!("offset {offset}: unexpected bytes after the last section")
+            }
+        };
+        write_prefixed(f, self.code(), &msg)
+    }
+}
+
+impl std::error::Error for ArbError {}
+
+// ---------------------------------------------------------------------------
 // Verification error report
 // ---------------------------------------------------------------------------
 
