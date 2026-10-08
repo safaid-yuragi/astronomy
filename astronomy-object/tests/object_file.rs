@@ -1,4 +1,4 @@
-//! Direct ELF64 object emission (`compile_object`): file structure,
+//! Direct ELF64 object emission (`astronomy_object::compile`): file structure,
 //! symbols and relocations, branch relaxation, determinism, and linking as
 //! executables and shared libraries — all without an external assembler.
 
@@ -21,7 +21,7 @@ const R_X86_64_PLT32: u32 = 4;
 
 fn object(module: Module) -> Vec<u8> {
     let verified = Verifier::verify(module).expect("module must verify");
-    astronomy_object::compile_object(&verified).expect("module must lower to ELF")
+    astronomy_object::compile(&verified).expect("module must lower to ELF")
 }
 
 /// `greet()` calls an internal helper and `puts`; `unused` is declared but
@@ -194,8 +194,8 @@ fn symbol_names_with_nul_are_rejected() {
     f.blocks.push(block);
     module.functions_mut().push(f);
     let verified = Verifier::verify(module).unwrap();
-    let err = astronomy_object::compile_object(&verified).unwrap_err();
-    assert_eq!(err.code(), "A-OBJ-005", "{err}");
+    let err = astronomy_object::compile(&verified).unwrap_err();
+    assert_eq!(err.code(), "A-X86-005", "{err}");
 }
 
 /// A loop whose body is far larger than 127 bytes forces both the backward

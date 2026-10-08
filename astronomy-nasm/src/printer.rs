@@ -1,13 +1,10 @@
 //! NASM source text emitter for lowered [`Program`]s.
-//!
-//! The text is a readable, assemblable rendering of exactly the same
-//! instructions the built-in encoder turns into machine code (see
-//! [`crate::encode`]); `nasm -f elf64` on this text yields the same
-//! `.text` and `.rodata` bytes as [`crate::compile_object`].
 
 use std::fmt::Write as _;
 
-use crate::asm::{Gpr, ImmStyle, Inst, LabelKind, Mem, Program, Reg, SymbolKind, Width, Xmm};
+use astronomy_x86::asm::{
+    Fp, Gpr, ImmStyle, Inst, Label, LabelKind, Mem, Program, Reg, SymbolKind, Width, Xmm,
+};
 
 /// Renders a lowered program as NASM source.
 pub fn print(program: &Program) -> String {
@@ -76,15 +73,15 @@ fn mem(m: Mem) -> String {
     }
 }
 
-fn fp_width(fp: crate::asm::Fp) -> &'static str {
+fn fp_width(fp: Fp) -> &'static str {
     match fp {
-        crate::asm::Fp::Single => "dword",
-        crate::asm::Fp::Double => "qword",
+        Fp::Single => "dword",
+        Fp::Double => "qword",
     }
 }
 
 fn print_inst(out: &mut String, program: &Program, labels: &[(String, LabelKind)], inst: &Inst) {
-    let label = |l: crate::asm::Label| labels[l.0 as usize].0.as_str();
+    let label = |l: Label| labels[l.0 as usize].0.as_str();
     let text = match inst {
         Inst::Label(l) => {
             let (name, kind) = &labels[l.0 as usize];

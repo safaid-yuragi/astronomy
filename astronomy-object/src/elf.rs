@@ -19,9 +19,10 @@
 //! and non-PIE executables and into shared libraries. Output is
 //! deterministic: no timestamps, no paths, no host-dependent data.
 
-use crate::asm::{rodata_layout, Program, SymbolKind};
+use astronomy_x86::asm::{rodata_layout, Program, SymbolKind};
+use astronomy_x86::BackendError;
+
 use crate::encode::{RelocTarget, Text};
-use crate::error::BackendError;
 
 const SHT_PROGBITS: u32 = 1;
 const SHT_SYMTAB: u32 = 2;

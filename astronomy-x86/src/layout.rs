@@ -306,11 +306,11 @@ mod tests {
         let ty = TypeId::new(14);
         assert_eq!(
             check_supported(&store, TypeId::I128, "test").unwrap_err().code(),
-            "A-OBJ-001"
+            "A-X86-001"
         );
         assert_eq!(
             check_supported(&store, ty, "test").unwrap_err().code(),
-            "A-OBJ-001"
+            "A-X86-001"
         );
     }
 

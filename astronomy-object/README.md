@@ -2,23 +2,19 @@
 
 **Astronomy's own native backend.** It compiles a verified
 [Astronomy IR](../README.md) module for **x86-64 Linux (System V AMD64)**
-straight to an **ELF64 relocatable object** (`.o`). Instruction selection,
-the machine-code encoder and the ELF writer all live in this crate, with no
-external dependencies — no assembler or other tool is involved. Link the
-result with `cc`/`ld` like any compiler output.
+straight to an **ELF64 relocatable object** (`.o`). The machine-code
+encoder and the ELF writer live in this crate, and instruction selection in
+[`astronomy-x86`](../astronomy-x86/README.md); there are no external
+dependencies and no assembler or other tool is involved. Link the result
+with `cc`/`ld` like any compiler output.
 
 ```text
-VerifiedModule ─▶ instruction selection ─▶ x86-64 insts ─┬─▶ encoder ─▶ ELF writer ─▶ .o ─▶ cc / ld
-                                                         └─▶ NASM printer ─▶ .asm   (for reading)
+VerifiedModule ─▶ astronomy-x86 (instruction selection) ─▶ encoder ─▶ ELF writer ─▶ .o ─▶ cc / ld
 ```
 
-For reading and debugging, the same instruction stream can also be printed
-as NASM source. The two agree byte for byte: assembling that text with
-`nasm -f elf64` yields exactly the `.text` and `.rodata` of the built-in
-object (the test suite checks this whenever NASM is installed).
-
-The core crate stays backend-free (§17 Non-goals, §56): this crate depends on
-`astronomy` by path and consumes only `&VerifiedModule`.
+For assembly text of the same code, use
+[`astronomy-nasm`](../astronomy-nasm/README.md); the two backends are
+independent crates that share only `astronomy-x86`.
 
 ## Usage
 
@@ -39,11 +35,12 @@ let sum = fb.add(a, c)?;
 fb.ret(Some(sum))?;
 
 let verified = Verifier::verify(b.finish())?;
-let object: Vec<u8> = astronomy_object::compile_object(&verified)?; // ELF64 .o
+let object: Vec<u8> = astronomy_object::compile(&verified)?; // ELF64 .o
 std::fs::write("demo.o", &object)?;
-
-let asm: String = astronomy_object::compile_nasm(&verified)?;       // same code as text
 ```
+
+`astronomy_object::assemble(&program)` encodes an already-lowered
+`astronomy_x86::asm::Program`.
 
 As a CLI (`.arn` or `.arb` input):
 
@@ -51,7 +48,6 @@ As a CLI (`.arn` or `.arb` input):
 arn2obj hello.arn                  # writes hello.o (like `cc -c`)
 arn2obj hello.arb -o out.o         # explicit output file
 arn2obj -o hello.o < hello.arn     # read stdin
-arn2obj --emit asm hello.arn       # NASM text to stdout
 ```
 
 Link the object like any compiler output — PIE (the default on most
@@ -64,22 +60,14 @@ cc -shared hello.o -o libhello.so
 
 ## Design
 
-Correctness first, not peak performance.
-
-### Pipeline
-
-* **Instruction selection** (`codegen.rs`) lowers IR to a typed x86-64
-  instruction model (`asm.rs`): sized registers, memory operands, labels,
-  data references and direct calls — never text.
-* **NASM printer** (`nasm.rs`) renders that model as NASM source.
-* **Encoder** (`encode.rs`) turns it into machine code: one canonical,
-  shortest encoding per instruction form (REX/ModRM/SIB, `imm8` vs `imm32`,
-  zero-extending `mov r32, imm`, ...), and branch relaxation that starts
-  every `jmp`/`jcc` short and widens it only when its target is out of
-  `rel8` range. Sizing runs in passes over the whole section in the same
-  order NASM's optimizer uses, which is what makes the two outputs
-  byte-identical; a final grow-only pass guarantees every short branch is
-  in range.
+* **Encoder** (`encode.rs`) turns each `astronomy-x86` instruction into
+  machine code: one canonical, shortest encoding per instruction form
+  (REX/ModRM/SIB, `imm8` vs `imm32`, zero-extending `mov r32, imm`, ...),
+  and branch relaxation that starts every `jmp`/`jcc` short and widens it
+  only when its target is out of `rel8` range. Sizing runs in passes over
+  the whole section in the same order NASM's optimizer uses, which keeps
+  the object byte-identical to NASM's assembly of `astronomy-nasm`'s text;
+  a final grow-only pass guarantees every short branch is in range.
 * **ELF writer** (`elf.rs`) emits a deterministic `ET_REL` object:
   `.text`, `.rodata`, an empty `.note.GNU-stack` (no executable stack,
   no linker warning), `.rela.text`, `.symtab`, `.strtab`, `.shstrtab`.
@@ -90,66 +78,13 @@ Correctness first, not peak performance.
   is reached RIP-relatively (`R_X86_64_PC32`), so there are no text
   relocations and the object links into PIE executables and shared
   libraries. Calls between functions of the module are resolved in place.
+* **Deterministic** — no timestamps, paths or host data in the object.
 
-### Code shape
-
-* **Everything lives in a stack slot.** Every SSA value — parameter, block
-  parameter or instruction result — gets an `rbp`-relative slot; instructions
-  load operands into registers, compute, and store the result back. There is
-  no register allocator, so lowering stays local and auditable.
-* **Blocks are labels; terminators are jumps.** `jump`/`branch` become
-  `jmp`/`je`; `return` becomes `leave; ret`; `unreachable` becomes `ud2`.
-* **Block arguments are parallel copies.** A jump stages all its argument
-  values into a per-block scratch area, then commits them to the target
-  block's parameter slots. The staging pass is what makes `jump bb(p1, p0)`
-  correct instead of clobbering a slot mid-copy.
-* **Fixed, aligned frame.** All slots are `rbp`-relative and `rsp` stays at a
-  16-byte boundary, with an outgoing stack-argument area reserved at the
-  bottom, so calls always see a properly aligned stack.
-* **System V AMD64 ABI** for every function: integer/pointer arguments in
-  `rdi, rsi, rdx, rcx, r8, r9`, float arguments in `xmm0..xmm7`, the rest on
-  the stack, returns in `rax`/`xmm0`, and `%al` set for variadic calls.
-* **Deterministic output** — the same module always produces byte-identical
-  assembly and object files (no timestamps, paths or host data).
-
-## Supported surface
-
-* Types: `i1`, `i8`..`i64`, `u8`..`u64`, `f32`, `f64`, pointers, arrays,
-  structs (used as in-memory values).
-* Instructions: `const` (int, float, null, string, aggregate), `add`/`sub`/
-  `mul`/`div`/`rem`, `and`/`or`/`xor`/`shl`/`shr`, `eq`/`ne`/`lt`/`le`/`gt`/`ge`,
-  `alloca`/`load`/`store`/`ptr_offset`, `ext`/`trunc`/`int_to_float`/
-  `float_to_int`/`ptr_cast`, `call`, `construct`/`extract`/`insert`.
-* Terminators: `jump`, `branch`, `return`, `unreachable` — all with block
-  arguments.
-
-Semantics follow `SPECIFICATION.md`: wrapping integer arithmetic, truncating
-signed division, arithmetic vs logical `shr` by signedness, out-of-range shifts
-producing `0`/the sign bit, saturating `float_to_int` with `NaN → 0`, and
-IEEE-754 float comparisons that treat `NaN` as unordered.
-`INT_MIN / -1` wraps and its remainder is zero. Shift counts may use any
-supported integer type independently of the shifted value; `ptr_offset`
-interprets the offset as signed even when its IR type is unsigned.
-
-## Deliberate limits
-
-Unsupported input fails with a structured error, never wrong code:
-
-| Code        | Meaning                                             |
-|-------------|-----------------------------------------------------|
-| `A-OBJ-001` | `i128`/`u128` (or a type containing one) is rejected |
-| `A-OBJ-002` | aggregates passed/returned by value are rejected     |
-| `A-OBJ-003` | unsupported ABI                                      |
-| `A-OBJ-004` | internal inconsistency (unreachable for verified IR) |
-| `A-OBJ-005` | not representable in an ELF object (e.g. NUL in a symbol name, > 2 GiB of code) |
-
-Every IR `Abi` (`c`, `astronomy`, `system`, `custom`) currently maps to the
-System V convention.
-
-Invalid integer widths, overflowing type layouts and stack frames too large
-for signed 32-bit displacements also fail with `A-OBJ-001`. An outgoing
-argument area that exceeds that frame limit fails with `A-OBJ-002`.
-Pointers to large types remain usable for address arithmetic.
+How IR is lowered (stack slots, block arguments, frame, ABI), the supported
+surface and the error codes are documented in
+[`astronomy-x86`](../astronomy-x86/README.md). Modules an ELF object cannot
+represent (a NUL byte in a symbol name, more than 2 GiB of code) fail with
+`A-X86-005`.
 
 ## Tests
 
@@ -159,32 +94,30 @@ cargo test -p astronomy-object
 
 * `tests/run_integers.rs`, `run_widths.rs`, `run_floats.rs`,
   `run_control_flow.rs`, `run_memory.rs`, `run_calls.rs` — each builds IR,
-  **emits an ELF object with the built-in encoder, links it with `gcc` (as a
-  PIE, with no linker warnings allowed) and runs the program**, asserting on
-  real output.
-* `tests/acceptance.rs` — full `.arn` round-trip then execution.
+  **compiles it to an object, links it with `gcc` (as a PIE, with no linker
+  warnings allowed) and runs the program**, asserting on real output.
 * `tests/differential.rs` — all supported integer widths and operators,
   mixed-width shifts, float/integer conversions checked against Rust casts,
   and interleaved register/stack arguments, with boundary values and
   deterministic random inputs.
 * `tests/regressions.rs` — division overflow, mixed-width shifts, signed
-  pointer offsets, large strides, empty aggregates, NASM keyword symbols
-  and layout/frame overflow.
+  pointer offsets, large strides, empty aggregates, register/keyword-named
+  symbols and layout/frame overflow.
 * `tests/object_file.rs` — ELF structure, symbol binding/types/sizes,
   PIE-friendly relocations, determinism, long-branch relaxation, linking
   into a shared library with `-z text`, and `readelf` acceptance.
-* `tests/codegen_text.rs` — emitted NASM directives, labels, determinism,
-  error codes (no toolchain needed).
-* `tests/cli.rs` — the `arn2obj` binary: object output and naming, stdin,
-  `--emit asm`, `.arb` input and error reporting.
+* `tests/cli.rs` — the `arn2obj` binary: output naming, stdin/stdout,
+  `.arb` input and error reporting.
 * Encoder unit tests (`src/encode.rs`) check individual encodings.
 
 **NASM as an independent reference.** NASM is never part of the pipeline,
-but when it is installed the suite uses it as an oracle:
+but when it is installed the suite uses it as an oracle (through
+`astronomy-nasm`, a dev-dependency only):
 
-* every execution test also assembles the printed NASM text and requires
-  its `.text`, `.rodata` and relocations to match the built-in object;
-* `src/nasm_crosscheck.rs` encodes every instruction form over the full
+* every execution test also assembles `astronomy-nasm`'s text for the same
+  module and requires its `.text`, `.rodata` and relocations to match the
+  object;
+* `tests/nasm_crosscheck.rs` encodes every instruction form over the full
   register file and every addressing shape (10,000+ instructions), plus 300
   random branch-dense functions, and requires NASM's bytes to be identical.
 

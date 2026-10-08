@@ -1,13 +1,14 @@
 //! Shared helpers for the `astronomy-object` integration tests.
 //!
-//! Tests build Astronomy IR in-memory and lower it with the backend. The
-//! execution helpers emit an ELF object with the **built-in encoder**, link
-//! it against a tiny C driver with `gcc` and run it. When `nasm` is also
-//! installed, the NASM text is assembled too and its `.text`, `.rodata` and
-//! relocations must match the built-in object exactly — NASM serves as an
-//! independent reference for the encoder, never as part of the pipeline.
-//! Without `gcc` the execution helpers return `None` and the test prints a
-//! skip message instead of failing.
+//! Tests build Astronomy IR in-memory and compile it to an ELF object with
+//! the **built-in encoder**; the execution helpers link it against a tiny C
+//! driver with `gcc` and run it. When `nasm` is also installed, the text
+//! `astronomy-nasm` prints for the same module (a dev-dependency) is
+//! assembled too, and its `.text`, `.rodata` and relocations must match the
+//! built-in object exactly — NASM serves as an independent reference for
+//! the encoder, never as part of the pipeline. Without `gcc` the execution
+//! helpers return `None` and the test prints a skip message instead of
+//! failing.
 
 #![allow(dead_code)]
 
@@ -18,16 +19,20 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use astronomy::{Abi, FunctionBuilder, Linkage, Module, ModuleBuilder, TypeId, Verifier};
 
-/// Verifies and lowers a module, returning the NASM text.
-pub fn compile_ok(module: Module) -> String {
+/// Verifies and compiles a module, returning the object's `.text` bytes.
+pub fn text_of(module: Module) -> Vec<u8> {
     let verified = Verifier::verify(module).expect("module must verify");
-    astronomy_object::compile_nasm(&verified).expect("module must lower to NASM")
+    let object = astronomy_object::compile(&verified).expect("module must compile");
+    Elf::parse(&object)
+        .section(".text")
+        .expect("object has .text")
+        .to_vec()
 }
 
-/// Verifies then lowers, expecting a backend error.
+/// Verifies then compiles, expecting a backend error.
 pub fn compile_err(module: Module) -> astronomy_object::BackendError {
     let verified = Verifier::verify(module).expect("module must verify");
-    astronomy_object::compile_nasm(&verified).expect_err("expected a backend error")
+    astronomy_object::compile(&verified).expect_err("expected a backend error")
 }
 
 /// Builds a module with a single exported `abi=c` function.
@@ -81,8 +86,10 @@ pub fn temp_dir() -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let dir =
-        std::env::temp_dir().join(format!("astronomy-object-{}-{n}-{nanos}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!(
+        "astronomy-object-{}-{n}-{nanos}",
+        std::process::id()
+    ));
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
@@ -101,8 +108,10 @@ pub fn assemble_and_run(module: Module, driver: &str) -> Option<RunOutput> {
     }
 
     let verified = Verifier::verify(module).expect("module must verify");
-    let asm = astronomy_object::compile_nasm(&verified).expect("module must lower to NASM");
-    let object = astronomy_object::compile_object(&verified).expect("module must lower to ELF");
+    let object = astronomy_object::compile(&verified).expect("module must compile");
+    // The same code as NASM text: the cross-check reference, and a readable
+    // listing for failure messages.
+    let asm = astronomy_nasm::compile(&verified).expect("module must lower to NASM");
 
     let dir = temp_dir();
     if nasm_available() {

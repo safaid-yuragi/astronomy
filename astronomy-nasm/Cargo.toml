@@ -1,0 +1,21 @@
+[package]
+name = "astronomy-nasm"
+version = "0.1.0"
+edition = "2021"
+description = "NASM (x86-64 System V) text backend for Astronomy IR"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+
+# Backends depend only on the core IR and the shared x86-64 lowering; this
+# crate has no external dependencies of its own.
+[dependencies]
+astronomy = { path = ".." }
+astronomy-x86 = { path = "../astronomy-x86" }
+
+[lib]
+name = "astronomy_nasm"
+path = "src/lib.rs"
+
+[[bin]]
+name = "arn2nasm"
+path = "src/bin/arn2nasm.rs"

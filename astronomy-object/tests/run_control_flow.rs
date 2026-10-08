@@ -4,7 +4,7 @@
 mod common;
 
 use astronomy::{TypeId, Verifier};
-use common::{assert_prints, compile_ok, one_function};
+use common::{assert_prints, one_function, text_of};
 
 const I64: TypeId = TypeId::I64;
 
@@ -220,8 +220,8 @@ fn unreachable_lowers_to_ud2() {
         fb.switch_to(dead).unwrap();
         fb.unreachable().unwrap();
     });
-    let asm = compile_ok(m);
-    assert!(asm.contains("ud2"), "{asm}");
+    let text = text_of(m);
+    assert!(text.windows(2).any(|w| w == [0x0F, 0x0B]), "expected ud2: {text:02x?}");
 }
 
 #[test]
@@ -235,7 +235,7 @@ fn unreachable_block_does_not_break_verification() {
         fb.switch_to(dead).unwrap();
         fb.unreachable().unwrap();
     });
-    // compile_ok verifies internally; a panic here would fail the test.
+    // Verification must accept the dead block; a panic would fail the test.
     let verified = Verifier::verify(m).unwrap();
     assert!(!verified.to_arn().is_empty());
 }

@@ -24,8 +24,8 @@
 //!   rest on the stack; `%al` is set for variadic calls.
 //!
 //! The output is a structured [`Program`] of [`Inst`]s, which
-//! [`crate::nasm`] prints as NASM text and [`crate::encode`] assembles into
-//! machine code. Unsupported constructs (128-bit integers, aggregates
+//! `astronomy-nasm` prints as NASM text and `astronomy-object` encodes into
+//! an ELF object. Unsupported constructs (128-bit integers, aggregates
 //! passed/returned by value) produce structured [`BackendError`]s instead
 //! of wrong code.
 

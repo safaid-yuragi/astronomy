@@ -4,60 +4,37 @@
 //! arn2obj hello.arn                  # writes hello.o (like `cc -c`)
 //! arn2obj hello.arb -o out.o         # .arb input, explicit output
 //! arn2obj -o hello.o < hello.arn     # stdin input
-//! arn2obj --emit asm hello.arn       # NASM text of the same code, to stdout
 //! ```
 //!
 //! The input may be `.arn` text or `.arb` binary (detected by content). The
-//! pipeline is exactly the library pipeline: load → verify → lower, then
-//! encode an ELF object with the built-in encoder (or print NASM text).
-//! Anything invalid fails with a structured, coded error.
+//! pipeline is exactly the library pipeline: load → verify → lower → encode
+//! an ELF object with the built-in encoder. Anything invalid fails with a
+//! structured, coded error.
 
 use std::io::{IsTerminal, Read, Write};
 use std::process::ExitCode;
 
 const USAGE: &str = "\
-usage: arn2obj [--emit obj|asm] [-o FILE] [FILE]
+usage: arn2obj [-o FILE] [FILE]
 
-  FILE          .arn text or .arb binary (stdin when omitted)
-  --emit obj    ELF64 relocatable object, encoded directly (default)
-  --emit asm    NASM source text of the same code
-  -o FILE       output file (`-` for stdout); by default an object goes to
-                FILE's name with a `.o` extension in the current directory
-                (stdout when reading stdin) and NASM text goes to stdout
+  FILE      .arn text or .arb binary (stdin when omitted)
+  -o FILE   output object file (`-` for stdout); by default FILE's name
+            with a `.o` extension in the current directory, or stdout
+            when reading stdin
 ";
 
-#[derive(PartialEq)]
-enum Emit {
-    Asm,
-    Obj,
-}
-
 struct Options {
-    emit: Emit,
     input: Option<String>,
     output: Option<String>,
 }
 
 fn parse_args() -> Result<Options, String> {
     let mut opts = Options {
-        emit: Emit::Obj,
         input: None,
         output: None,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
-        let emit_value = match arg.as_str() {
-            "--emit" => Some(args.next().ok_or("`--emit` needs a value")?),
-            _ => arg.strip_prefix("--emit=").map(str::to_string),
-        };
-        if let Some(value) = emit_value {
-            opts.emit = match value.as_str() {
-                "asm" => Emit::Asm,
-                "obj" => Emit::Obj,
-                other => return Err(format!("unknown `--emit` kind `{other}` (use asm or obj)")),
-            };
-            continue;
-        }
         match arg.as_str() {
             "-o" => opts.output = Some(args.next().ok_or("`-o` needs a file name")?),
             "-h" | "--help" => return Err(String::new()),
@@ -94,33 +71,27 @@ fn run(opts: Options) -> Result<(), String> {
     };
     let module = loaded.map_err(|(code, msg)| format!("error[{code}]: {msg}"))?;
     let verified = module.verify().map_err(|report| report.to_string())?;
+    let object =
+        astronomy_object::compile(&verified).map_err(|e| format!("error[{}]: {e}", e.code()))?;
 
-    let bytes = match opts.emit {
-        Emit::Asm => astronomy_object::compile_nasm(&verified).map(String::into_bytes),
-        Emit::Obj => astronomy_object::compile_object(&verified),
-    }
-    .map_err(|e| format!("error[{}]: {e}", e.code()))?;
-
-    let output = opts
-        .output
-        .or_else(|| match (&opts.emit, opts.input.as_deref()) {
-            (Emit::Obj, Some(input)) if input != "-" => Some(default_object_name(input)),
-            _ => None,
-        });
+    let output = opts.output.or_else(|| match opts.input.as_deref() {
+        Some(input) if input != "-" => Some(default_object_name(input)),
+        _ => None,
+    });
     match output.as_deref() {
         Some(path) if path != "-" => {
-            std::fs::write(path, &bytes).map_err(|e| format!("error: cannot write `{path}`: {e}"))
+            std::fs::write(path, &object).map_err(|e| format!("error: cannot write `{path}`: {e}"))
         }
         _ => {
             let mut stdout = std::io::stdout();
-            if opts.emit == Emit::Obj && stdout.is_terminal() {
+            if stdout.is_terminal() {
                 return Err(
                     "error: refusing to write an object file to a terminal; use `-o FILE`"
                         .to_string(),
                 );
             }
             stdout
-                .write_all(&bytes)
+                .write_all(&object)
                 .and_then(|()| stdout.flush())
                 .map_err(|e| format!("error: cannot write output: {e}"))
         }

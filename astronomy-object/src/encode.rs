@@ -12,8 +12,8 @@
 //!   branch is sized from offsets already reached in the current pass
 //!   (backward targets) or recorded in the previous pass (forward targets,
 //!   optimistically short while still unknown), until nothing moves. This
-//!   makes [`crate::compile_object`] byte-identical to `nasm -f elf64` on
-//!   [`crate::compile_nasm`]'s text. A final grow-only pass then guarantees every
+//!   makes [`crate::compile`] byte-identical to `nasm -f elf64` on the text
+//!   `astronomy-nasm` prints for the same module. A final grow-only pass then guarantees every
 //!   short branch is in range regardless of how the passes ended.
 //! * Functions are laid out back to back. Calls between functions of the
 //!   module are resolved directly; calls to declarations and references to
@@ -21,10 +21,10 @@
 
 use astronomy::FunctionId;
 
-use crate::asm::{
-    rodata_layout, AluOp, Cond, DataId, Fp, Gpr, Inst, Mem, Program, SymbolKind, Width,
+use astronomy_x86::asm::{
+    rodata_layout, AluOp, Cond, DataId, Fp, Gpr, Inst, Label, Mem, Program, SymbolKind, Width,
 };
-use crate::error::BackendError;
+use astronomy_x86::BackendError;
 
 /// Assembled code of a whole program.
 #[derive(Debug, Clone, Default)]
@@ -105,8 +105,8 @@ impl Piece {
     }
 }
 
-/// Assembles every function of `program`.
-pub fn assemble(program: &Program) -> Result<Text, BackendError> {
+/// Encodes every function of `program` into one `.text` section.
+pub fn encode_text(program: &Program) -> Result<Text, BackendError> {
     // 1. Pre-encode everything; labels are numbered section-wide.
     let mut scratch = Vec::new();
     let mut pieces = Vec::new();
@@ -114,7 +114,7 @@ pub fn assemble(program: &Program) -> Result<Text, BackendError> {
     let mut label_count = 0usize;
     for func in &program.functions {
         let first = pieces.len();
-        let local = |l: crate::asm::Label| {
+        let local = |l: Label| {
             let l = l.0 as usize;
             if l < func.labels.len() {
                 Ok(label_count + l)
@@ -871,7 +871,7 @@ fn encode(out: &mut Vec<u8>, inst: &Inst) -> Option<(usize, FixupKind)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::asm::{ImmStyle, Reg, ShiftOp, SseOp, Xmm};
+    use astronomy_x86::asm::{ImmStyle, Reg, ShiftOp, SseOp, Xmm};
 
     fn enc(inst: Inst) -> Vec<u8> {
         let mut out = Vec::new();
@@ -1160,7 +1160,7 @@ mod tests {
     }
 
     fn assemble_one(insts: Vec<Inst>, labels: usize) -> Vec<u8> {
-        use crate::asm::{FuncCode, FuncSymbol, LabelKind};
+        use astronomy_x86::asm::{FuncCode, FuncSymbol, LabelKind};
         let program = Program {
             symbols: vec![FuncSymbol {
                 name: "f".into(),
@@ -1175,12 +1175,11 @@ mod tests {
             }],
             rodata: Vec::new(),
         };
-        assemble(&program).unwrap().bytes
+        encode_text(&program).unwrap().bytes
     }
 
     #[test]
     fn branches_relax_only_when_needed() {
-        use crate::asm::Label;
         // A backward jump within range stays short.
         let bytes = assemble_one(vec![Inst::Label(Label(0)), Inst::Jmp(Label(0))], 1);
         assert_eq!(bytes, [0xEB, 0xFE]);
@@ -1206,7 +1205,7 @@ mod tests {
 
     #[test]
     fn undefined_labels_are_errors() {
-        use crate::asm::{FuncCode, FuncSymbol, Label, LabelKind};
+        use astronomy_x86::asm::{FuncCode, FuncSymbol, LabelKind};
         let program = Program {
             symbols: vec![FuncSymbol {
                 name: "f".into(),
@@ -1219,6 +1218,6 @@ mod tests {
             }],
             rodata: Vec::new(),
         };
-        assert_eq!(assemble(&program).unwrap_err().code(), "A-OBJ-004");
+        assert_eq!(encode_text(&program).unwrap_err().code(), "A-X86-004");
     }
 }

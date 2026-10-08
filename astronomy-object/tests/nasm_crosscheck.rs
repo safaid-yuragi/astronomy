@@ -1,18 +1,22 @@
 //! Exhaustive encoder cross-check against NASM.
 //!
-//! Builds functions containing every instruction form of the model over
-//! the full register file, every addressing shape (each base register with
-//! no, 8-bit and 32-bit displacements, plus RIP-relative data) and a spread
-//! of immediates, plus randomized branch-dense functions, prints them with
-//! the NASM emitter, assembles them with `nasm -f elf64`, and requires
-//! NASM's `.text` to equal the built-in encoder's byte for byte. Skips when
-//! `nasm` is not installed.
+//! Builds `astronomy-x86` programs containing every instruction form of the
+//! model over the full register file, every addressing shape (each base
+//! register with no, 8-bit and 32-bit displacements, plus RIP-relative
+//! data) and a spread of immediates, plus randomized branch-dense
+//! functions. Each program is printed by `astronomy-nasm`, assembled with
+//! `nasm -f elf64`, and NASM's `.text` must equal the built-in encoder's
+//! (`astronomy_object::assemble`) byte for byte. Skips when `nasm` is not
+//! installed.
+
+mod common;
 
 use std::process::Command;
 
 use astronomy::FunctionId;
+use common::Elf;
 
-use crate::asm::{
+use astronomy_x86::asm::{
     AluOp, Cond, DataId, Fp, FuncCode, FuncSymbol, ImmStyle, Inst, Label, LabelKind, Mem, Program,
     Reg, ShiftOp, SseOp, SymbolKind, Width, Xmm,
 };
@@ -326,18 +330,11 @@ fn random_branches(rng: &mut Rng) -> (Vec<Inst>, usize) {
     (v, labels)
 }
 
-/// Returns the contents of `.text` in an ELF64 object.
-fn text_section(elf: &[u8]) -> &[u8] {
-    let u16_at = |at: usize| u16::from_le_bytes(elf[at..at + 2].try_into().unwrap()) as usize;
-    let u32_at = |at: usize| u32::from_le_bytes(elf[at..at + 4].try_into().unwrap()) as usize;
-    let u64_at = |at: usize| u64::from_le_bytes(elf[at..at + 8].try_into().unwrap()) as usize;
-    let (shoff, shnum, shstrndx) = (u64_at(0x28), u16_at(0x3C), u16_at(0x3E));
-    let names = u64_at(shoff + shstrndx * 64 + 24);
-    (0..shnum)
-        .map(|i| shoff + i * 64)
-        .find(|&h| elf[names + u32_at(h)..].starts_with(b".text\0"))
-        .map(|h| &elf[u64_at(h + 24)..u64_at(h + 24) + u64_at(h + 32)])
-        .expect("object has .text")
+/// Our object for `program`, and its `.text`.
+fn ours(program: &Program) -> (Vec<u8>, Vec<u8>) {
+    let object = astronomy_object::assemble(program).expect("encodes");
+    let text = Elf::parse(&object).section(".text").unwrap().to_vec();
+    (object, text)
 }
 
 fn nasm_available() -> bool {
@@ -349,7 +346,7 @@ fn nasm_text(program: &Program, tag: &str) -> Vec<u8> {
     let dir = std::env::temp_dir().join(format!("astronomy-object-{tag}-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let (asm_path, obj_path) = (dir.join("forms.asm"), dir.join("forms.o"));
-    std::fs::write(&asm_path, crate::nasm::print(program)).unwrap();
+    std::fs::write(&asm_path, astronomy_nasm::print(program)).unwrap();
     let out = Command::new("nasm")
         .args(["-f", "elf64", "-w-all"])
         .arg(&asm_path)
@@ -364,7 +361,7 @@ fn nasm_text(program: &Program, tag: &str) -> Vec<u8> {
     );
     let elf = std::fs::read(&obj_path).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
-    text_section(&elf).to_vec()
+    Elf::parse(&elf).section(".text").unwrap().to_vec()
 }
 
 fn function(id: u32, labels: usize, insts: Vec<Inst>) -> FuncCode {
@@ -399,7 +396,7 @@ fn encoder_matches_nasm_for_every_form() {
     let insts = every_form();
     assert!(insts.len() > 10_000, "the matrix should be exhaustive");
     let program = program(vec![function(0, 3, insts.clone())]);
-    let ours = crate::encode::assemble(&program).expect("encodes").bytes;
+    let (_, ours) = ours(&program);
     let theirs = nasm_text(&program, "forms");
     if ours == theirs {
         return;
@@ -419,7 +416,7 @@ fn encoder_matches_nasm_for_every_form() {
             _ => {}
         }
         let single = self::program(vec![function(0, 0, vec![inst.clone()])]);
-        let one = crate::encode::assemble(&single).expect("encodes").bytes;
+        let (_, one) = self::ours(&single);
         if theirs.get(at..at + one.len()) != Some(&one[..]) {
             let end = (at + one.len() + 4).min(theirs.len());
             panic!(
@@ -452,17 +449,19 @@ fn branch_relaxation_matches_nasm() {
         })
         .collect();
     let program = program(functions);
-    let ours = crate::encode::assemble(&program).expect("encodes");
+    let (object, ours) = ours(&program);
     let theirs = nasm_text(&program, "branches");
-    if ours.bytes != theirs {
-        let first = ours
-            .functions
-            .iter()
-            .find(|(_, start, size)| {
-                let range = *start as usize..(*start + *size) as usize;
-                theirs.get(range.clone()) != Some(&ours.bytes[range])
+    if ours != theirs {
+        // Name the first function whose bytes differ (symbols carry sizes).
+        let first = Elf::parse(&object)
+            .symbols()
+            .into_iter()
+            .filter(|s| s.size > 0)
+            .find(|s| {
+                let range = s.value as usize..(s.value + s.size) as usize;
+                theirs.get(range.clone()) != Some(&ours[range])
             })
-            .map(|(id, ..)| id.index());
-        panic!("branch layout differs from NASM, first in function {first:?}");
+            .map(|s| s.name);
+        panic!("branch layout differs from NASM, first in {first:?}");
     }
 }

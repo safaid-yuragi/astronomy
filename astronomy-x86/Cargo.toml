@@ -1,0 +1,15 @@
+[package]
+name = "astronomy-x86"
+version = "0.1.0"
+edition = "2021"
+description = "x86-64 (System V) instruction selection for Astronomy IR, shared by the astronomy-nasm and astronomy-object backends"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+
+# Depends only on the core IR; no external dependencies.
+[dependencies]
+astronomy = { path = ".." }
+
+[lib]
+name = "astronomy_x86"
+path = "src/lib.rs"

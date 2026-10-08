@@ -2,14 +2,19 @@
 name = "astronomy-object"
 version = "0.1.0"
 edition = "2021"
-description = "Out-of-tree x86-64 (System V) native backend for Astronomy IR: ELF objects and NASM text"
+description = "Astronomy IR's own x86-64 Linux backend: compiles straight to ELF64 relocatable objects"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 
-# Backends depend only on the core IR; this crate has no external
-# dependencies of its own (its encoder and ELF writer are built in).
+# Backends depend only on the core IR and the shared x86-64 lowering; the
+# encoder and ELF writer are built in, so there are no external dependencies.
 [dependencies]
 astronomy = { path = ".." }
+astronomy-x86 = { path = "../astronomy-x86" }
+
+# Tests only: NASM text serves as an independent reference for the encoder.
+[dev-dependencies]
+astronomy-nasm = { path = "../astronomy-nasm" }
 
 [lib]
 name = "astronomy_object"

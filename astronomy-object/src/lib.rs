@@ -2,24 +2,18 @@
 //!
 //! Astronomy's own **native backend**: it compiles a [`VerifiedModule`] for
 //! x86-64 Linux (System V AMD64) **straight to an ELF64 relocatable object**
-//! (`.o`) with [`compile_object`]. Instruction selection, the machine-code
-//! encoder and the ELF writer are all part of this crate — no assembler or
-//! other external tool is involved; link the result with `cc`/`ld` like any
-//! compiler output.
-//!
-//! For reading and debugging, [`compile_nasm`] renders the very same
-//! instructions as NASM source text.
+//! (`.o`). The machine-code encoder and the ELF writer are part of this
+//! crate, and instruction selection comes from `astronomy-x86` — no
+//! assembler or other external tool is involved. Link the result with
+//! `cc`/`ld` like any compiler output.
 //!
 //! ```text
-//! VerifiedModule ──▶ instruction selection ──┬──▶ encoder + ELF writer ──▶ .o
-//!                                            └──▶ NASM printer ──────────▶ .asm
+//! VerifiedModule ──▶ astronomy-x86 (instruction selection) ──▶ encoder ──▶ ELF writer ──▶ .o
 //! ```
 //!
-//! Both outputs come from one structured instruction stream and agree byte
-//! for byte: `nasm -f elf64` on the text yields exactly the `.text` and
-//! `.rodata` of [`compile_object`]'s output. The backend accepts only
-//! verified IR (the type-level contract from the core crate), has no
-//! external dependencies, and its output is deterministic.
+//! The object is deterministic and links into PIE executables, non-PIE
+//! executables and shared libraries. The backend accepts only verified IR
+//! and has no external dependencies.
 //!
 //! ## Example
 //!
@@ -42,68 +36,36 @@
 //! fb.ret(Some(sum))?;
 //!
 //! let verified = Verifier::verify(b.finish())?;
-//!
 //! // An object file, ready for `cc main.c demo.o`:
-//! std::fs::write("demo.o", astronomy_object::compile_object(&verified)?)?;
-//!
-//! // The same code as NASM text:
-//! let asm: String = astronomy_object::compile_nasm(&verified)?;
-//! assert!(asm.contains("add:"));
+//! std::fs::write("demo.o", astronomy_object::compile(&verified)?)?;
 //! # Ok(())
 //! # }
 //! ```
 //!
-//! ## Supported surface
-//!
-//! * All integer widths up to 64 bits (`i1`..`i64`, `u8`..`u64`), `f32`,
-//!   `f64`, pointers, arrays and structs.
-//! * Every instruction in the core instruction set, including
-//!   `alloca`/`load`/`store`/`ptr_offset`, conversions, calls,
-//!   `construct`/`extract`/`insert`, and all terminators with block
-//!   arguments.
-//! * The System V AMD64 calling convention, including variadic calls
-//!   (`%al` semantics).
-//!
-//! ## Deliberate limits
-//!
-//! * `i128`/`u128` are rejected with `A-OBJ-001` rather than lowered
-//!   incorrectly.
-//! * Aggregates (structs/arrays) are supported as in-memory values but not
-//!   passed or returned by value; those cases return `A-OBJ-002`.
-//! * Every IR `Abi` (`c`, `astronomy`, `system`, `custom`) maps to the
-//!   System V AMD64 convention; the `Abi` fact is not otherwise varied.
-//! * Modules that an ELF object cannot represent (a NUL byte in a symbol
-//!   name, more than 2 GiB of code) fail [`compile_object`] with
-//!   `A-OBJ-005`.
+//! Supported surface and lowering limits are those of `astronomy-x86`;
+//! errors are its [`BackendError`] (`A-X86-*`). Modules an ELF object
+//! cannot represent (a NUL byte in a symbol name, more than 2 GiB of code)
+//! fail with `A-X86-005`.
 
 #![warn(missing_docs)]
 
-mod asm;
-mod codegen;
 mod elf;
 mod encode;
-mod error;
-mod layout;
-mod nasm;
 
-#[cfg(test)]
-mod nasm_crosscheck;
-
-pub use error::BackendError;
+pub use astronomy_x86::BackendError;
 
 use astronomy::VerifiedModule;
+use astronomy_x86::asm::Program;
 
 /// Compiles a verified module straight to an ELF64 relocatable object
 /// (`.o`) for x86-64 Linux, using the built-in encoder — no assembler is
 /// involved. Link the result with `cc`/`ld` like any compiler output.
-pub fn compile_object(module: &VerifiedModule) -> Result<Vec<u8>, BackendError> {
-    let program = codegen::lower(module)?;
-    let text = encode::assemble(&program)?;
-    elf::write(&program, &text)
+pub fn compile(module: &VerifiedModule) -> Result<Vec<u8>, BackendError> {
+    astronomy_x86::lower(module).and_then(|program| assemble(&program))
 }
 
-/// Renders the code [`compile_object`] would produce as NASM (x86-64,
-/// System V AMD64) source text, for reading and debugging.
-pub fn compile_nasm(module: &VerifiedModule) -> Result<String, BackendError> {
-    codegen::lower(module).map(|program| nasm::print(&program))
+/// Encodes an already-lowered program into an ELF64 relocatable object.
+pub fn assemble(program: &Program) -> Result<Vec<u8>, BackendError> {
+    let text = encode::encode_text(program)?;
+    elf::write(program, &text)
 }

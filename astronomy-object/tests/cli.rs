@@ -1,8 +1,8 @@
-//! End-to-end CLI test: `arn2obj` loads `.arn`/`.arb`, verifies and emits
-//! an ELF object (or NASM text), exercising the same pipeline a user would
-//! drive from the shell.
+//! End-to-end CLI test: `arn2obj` loads `.arn`/`.arb`, verifies and writes
+//! an ELF object, exercising the same pipeline a user would drive from the
+//! shell.
 
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 const ADD_ARN: &str = "\
 ::ASTRONOMY::MODULE_START
@@ -23,28 +23,61 @@ fn scratch(name: &str) -> std::path::PathBuf {
     dir.join(name)
 }
 
-#[test]
-fn cli_prints_nasm_text() {
-    let path = scratch("add.arn");
-    std::fs::write(&path, ADD_ARN).unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_arn2obj"))
-        .args(["--emit", "asm"])
-        .arg(&path)
-        .output()
-        .unwrap();
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
-    let asm = String::from_utf8(out.stdout).unwrap();
-    assert!(asm.contains("global $add"), "{asm}");
-    assert!(asm.contains("    add rax, rcx"), "{asm}");
-    assert!(asm.contains("    ret"), "{asm}");
-    let _ = std::fs::remove_file(&path);
+fn arn2obj() -> Command {
+    Command::new(env!("CARGO_BIN_EXE_arn2obj"))
+}
+
+/// Asserts `bytes` is an x86-64 ELF relocatable object.
+fn assert_object(bytes: &[u8]) {
+    assert_eq!(&bytes[..4], b"\x7fELF", "not an ELF file");
+    assert_eq!(u16::from_le_bytes([bytes[16], bytes[17]]), 1, "ET_REL");
+    assert_eq!(u16::from_le_bytes([bytes[18], bytes[19]]), 62, "EM_X86_64");
 }
 
 #[test]
-fn cli_reads_stdin() {
+fn cli_writes_the_requested_file() {
+    let input = scratch("obj.arn");
+    let output = scratch("obj.o");
+    std::fs::write(&input, ADD_ARN).unwrap();
+    let out = arn2obj()
+        .arg(&input)
+        .arg("-o")
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_object(&std::fs::read(&output).unwrap());
+    let _ = std::fs::remove_file(&input);
+    let _ = std::fs::remove_file(&output);
+}
+
+#[test]
+fn cli_names_the_object_after_its_input() {
+    // Like `cc -c`: `dir/named.arn` becomes `named.o` in the current directory.
+    let input = scratch("named.arn");
+    std::fs::write(&input, ADD_ARN).unwrap();
+    let cwd = scratch("cwd");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let out = arn2obj().arg(&input).current_dir(&cwd).output().unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.stdout.is_empty());
+    assert_object(&std::fs::read(cwd.join("named.o")).expect("named.o is written"));
+    let _ = std::fs::remove_dir_all(&cwd);
+    let _ = std::fs::remove_file(&input);
+}
+
+#[test]
+fn cli_reads_stdin_and_writes_stdout() {
     use std::io::Write;
-    use std::process::Stdio;
-    let mut child = Command::new(env!("CARGO_BIN_EXE_arn2obj"))
+    let mut child = arn2obj()
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -57,36 +90,44 @@ fn cli_reads_stdin() {
         .unwrap();
     let out = child.wait_with_output().unwrap();
     assert!(out.status.success());
-    // Without `-o`, an object read from stdin goes to (piped) stdout.
-    assert!(out.stdout.starts_with(b"\x7fELF"), "expected an ELF object");
+    assert_object(&out.stdout);
+}
+
+#[test]
+fn cli_accepts_arb_binary() {
+    let module = astronomy::Module::parse_arn(ADD_ARN).unwrap();
+    let input = scratch("add.arb");
+    let output = scratch("add-arb.o");
+    std::fs::write(&input, module.to_arb()).unwrap();
+    let out = arn2obj()
+        .arg(&input)
+        .arg("-o")
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_object(&std::fs::read(&output).unwrap());
+    let _ = std::fs::remove_file(&input);
+    let _ = std::fs::remove_file(&output);
 }
 
 #[test]
 fn cli_rejects_invalid_arn() {
     let path = scratch("bad.arn");
     std::fs::write(&path, "::ASTRONOMY::MODULE_START\n::ASTRONOMY::BOGUS\n").unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_arn2obj"))
+    let out = arn2obj()
         .arg(&path)
+        .arg("-o")
+        .arg(scratch("bad.o"))
         .output()
         .unwrap();
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("A-ARN"));
-    let _ = std::fs::remove_file(&path);
-}
-
-#[test]
-fn cli_transcompiles_arb_binary() {
-    let module = astronomy::Module::parse_arn(ADD_ARN).unwrap();
-    let path = scratch("add.arb");
-    std::fs::write(&path, module.to_arb()).unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_arn2obj"))
-        .args(["--emit", "asm"])
-        .arg(&path)
-        .output()
-        .unwrap();
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
-    let asm = String::from_utf8(out.stdout).unwrap();
-    assert!(asm.contains("global $add"), "{asm}");
+    assert!(!scratch("bad.o").exists(), "no output on failure");
     let _ = std::fs::remove_file(&path);
 }
 
@@ -98,61 +139,15 @@ fn cli_rejects_corrupt_arb() {
     bytes[mid] ^= 0xFF;
     let path = scratch("corrupt.arb");
     std::fs::write(&path, bytes).unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_arn2obj"))
-        .arg(&path)
-        .output()
-        .unwrap();
+    let out = arn2obj().arg(&path).arg("-o").arg("-").output().unwrap();
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("A-ARB-005"));
     let _ = std::fs::remove_file(&path);
 }
 
 #[test]
-fn cli_emits_an_object_file_directly() {
-    let input = scratch("obj.arn");
-    let output = scratch("obj.o");
-    std::fs::write(&input, ADD_ARN).unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_arn2obj"))
-        .args(["--emit", "obj"])
-        .arg(&input)
-        .arg("-o")
-        .arg(&output)
-        .output()
-        .unwrap();
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
-    let bytes = std::fs::read(&output).unwrap();
-    assert_eq!(&bytes[..4], b"\x7fELF");
-    assert_eq!(u16::from_le_bytes([bytes[16], bytes[17]]), 1, "relocatable object");
-    let _ = std::fs::remove_file(&input);
-    let _ = std::fs::remove_file(&output);
-}
-
-#[test]
-fn cli_names_the_object_after_its_input() {
-    // Like `cc -c`: `dir/named.arn` becomes `named.o` in the current directory.
-    let input = scratch("named.arn");
-    std::fs::write(&input, ADD_ARN).unwrap();
-    let cwd = scratch("cwd");
-    std::fs::create_dir_all(&cwd).unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_arn2obj"))
-        .arg(&input)
-        .current_dir(&cwd)
-        .output()
-        .unwrap();
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
-    assert!(out.stdout.is_empty());
-    let bytes = std::fs::read(cwd.join("named.o")).expect("named.o is written");
-    assert_eq!(&bytes[..4], b"\x7fELF");
-    let _ = std::fs::remove_dir_all(&cwd);
-    let _ = std::fs::remove_file(&input);
-}
-
-#[test]
-fn cli_rejects_unknown_emit_kind() {
-    let out = Command::new(env!("CARGO_BIN_EXE_arn2obj"))
-        .arg("--emit=exe")
-        .output()
-        .unwrap();
+fn cli_rejects_unknown_options() {
+    let out = arn2obj().arg("--emit=asm").output().unwrap();
     assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("unknown `--emit` kind"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("unknown option"));
 }

@@ -1,15 +1,15 @@
 //! Structured x86-64 machine instructions.
 //!
-//! The code generator lowers Astronomy IR to this small instruction model
-//! instead of to text. Two independent emitters consume it:
+//! [`crate::lower`] turns Astronomy IR into a [`Program`] of these
+//! instructions instead of text. The backends consume it independently:
 //!
-//! * [`crate::nasm`] prints NASM source text;
-//! * [`crate::encode`] + [`crate::elf`] produce an ELF64 relocatable object
-//!   directly, with no external assembler.
+//! * `astronomy-nasm` prints it as NASM source text;
+//! * `astronomy-object` encodes it into machine code and writes an ELF64
+//!   relocatable object, with no external assembler.
 //!
 //! The model covers exactly the instruction forms the code generator uses.
 //! Every operand is typed (register widths, memory operands, labels), so
-//! both emitters work from the same facts and cannot drift apart.
+//! both backends work from the same facts and cannot drift apart.
 
 use astronomy::FunctionId;
 
@@ -310,6 +310,11 @@ pub enum ImmStyle {
 }
 
 /// One machine instruction (or a label pseudo-instruction).
+///
+/// Operands are named by role, in Intel order: `dst` is written, `src`,
+/// `mem`, `imm`, `a`/`b` are read (`mem` is written by stores), `op`
+/// selects the operation and `fp` the float precision.
+#[allow(missing_docs)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Inst {
     /// Defines a label at this position.
@@ -452,7 +457,7 @@ impl Program {
 /// Byte offset of each read-only data entry, plus the total size.
 ///
 /// An empty entry still occupies one zero byte so that every label is
-/// distinct (the NASM printer emits `db 0` for it).
+/// distinct (NASM text spells it `db 0`).
 pub fn rodata_layout(entries: &[Vec<u8>]) -> (Vec<u64>, u64) {
     let mut offsets = Vec::with_capacity(entries.len());
     let mut at = 0u64;
