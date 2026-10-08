@@ -1,78 +1,140 @@
-//! `arn2nasm` — transcompile an Astronomy module to NASM assembly.
+//! `arn2nasm` — compile an Astronomy module for x86-64 Linux.
 //!
 //! ```text
-//! arn2nasm hello.arn > hello.asm
+//! arn2nasm hello.arn > hello.asm              # NASM source
+//! arn2nasm --emit obj hello.arn -o hello.o    # ELF64 object, no assembler
 //! arn2nasm hello.arb > hello.asm
 //! arn2nasm < hello.arn
 //! ```
 //!
 //! The input may be `.arn` text or `.arb` binary (detected by content). The
-//! pipeline is exactly the library pipeline: load → verify → lower to NASM.
-//! Anything invalid fails with a structured, coded error.
+//! pipeline is exactly the library pipeline: load → verify → lower, then
+//! either print NASM text or encode an object file with the built-in
+//! encoder. Anything invalid fails with a structured, coded error.
 
-use std::io::Read;
+use std::io::{IsTerminal, Read, Write};
 use std::process::ExitCode;
 
-fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let source = match args.as_slice() {
-        [] => {
-            let mut buf = Vec::new();
-            if let Err(e) = std::io::stdin().read_to_end(&mut buf) {
-                eprintln!("error: cannot read stdin: {e}");
-                return ExitCode::FAILURE;
+const USAGE: &str = "\
+usage: arn2nasm [--emit asm|obj] [-o FILE] [FILE]
+
+  FILE          .arn text or .arb binary (stdin when omitted)
+  --emit asm    NASM source text (default)
+  --emit obj    ELF64 relocatable object (.o), encoded directly
+  -o FILE       write the output to FILE instead of stdout
+";
+
+#[derive(PartialEq)]
+enum Emit {
+    Asm,
+    Obj,
+}
+
+struct Options {
+    emit: Emit,
+    input: Option<String>,
+    output: Option<String>,
+}
+
+fn parse_args() -> Result<Options, String> {
+    let mut opts = Options {
+        emit: Emit::Asm,
+        input: None,
+        output: None,
+    };
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        let emit_value = match arg.as_str() {
+            "--emit" => Some(args.next().ok_or("`--emit` needs a value")?),
+            _ => arg.strip_prefix("--emit=").map(str::to_string),
+        };
+        if let Some(value) = emit_value {
+            opts.emit = match value.as_str() {
+                "asm" => Emit::Asm,
+                "obj" => Emit::Obj,
+                other => return Err(format!("unknown `--emit` kind `{other}` (use asm or obj)")),
+            };
+            continue;
+        }
+        match arg.as_str() {
+            "-o" => opts.output = Some(args.next().ok_or("`-o` needs a file name")?),
+            "-h" | "--help" => return Err(String::new()),
+            flag if flag.starts_with('-') && flag != "-" => {
+                return Err(format!("unknown option `{flag}`"))
             }
+            path if opts.input.is_none() => opts.input = Some(path.to_string()),
+            _ => return Err("only one input file may be given".to_string()),
+        }
+    }
+    Ok(opts)
+}
+
+fn run(opts: Options) -> Result<(), String> {
+    let source = match opts.input.as_deref() {
+        None | Some("-") => {
+            let mut buf = Vec::new();
+            std::io::stdin()
+                .read_to_end(&mut buf)
+                .map_err(|e| format!("error: cannot read stdin: {e}"))?;
             buf
         }
-        [flag] if flag == "-h" || flag == "--help" => {
-            println!("usage: arn2nasm [file.arn|file.arb]   (reads stdin when omitted)");
-            return ExitCode::SUCCESS;
-        }
-        [path] => match std::fs::read(path) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("error: cannot read `{path}`: {e}");
-                return ExitCode::FAILURE;
-            }
-        },
-        _ => {
-            eprintln!("usage: arn2nasm [file.arn|file.arb]");
-            return ExitCode::FAILURE;
+        Some(path) => {
+            std::fs::read(path).map_err(|e| format!("error: cannot read `{path}`: {e}"))?
         }
     };
 
     let loaded = if astronomy::binary::is_arb(&source) {
         astronomy::binary::read(&source).map_err(|e| (e.code(), e.to_string()))
     } else {
-        match String::from_utf8(source) {
-            Ok(text) => astronomy::text::parse(&text).map_err(|e| (e.code(), e.to_string())),
-            Err(_) => {
-                eprintln!("error: input is neither .arb binary nor UTF-8 .arn text");
-                return ExitCode::FAILURE;
+        let text = String::from_utf8(source)
+            .map_err(|_| "error: input is neither .arb binary nor UTF-8 .arn text".to_string())?;
+        astronomy::text::parse(&text).map_err(|e| (e.code(), e.to_string()))
+    };
+    let module = loaded.map_err(|(code, msg)| format!("error[{code}]: {msg}"))?;
+    let verified = module.verify().map_err(|report| report.to_string())?;
+
+    let bytes = match opts.emit {
+        Emit::Asm => astronomy_nasm::compile(&verified).map(String::into_bytes),
+        Emit::Obj => astronomy_nasm::compile_object(&verified),
+    }
+    .map_err(|e| format!("error[{}]: {e}", e.code()))?;
+
+    match opts.output.as_deref() {
+        Some(path) if path != "-" => {
+            std::fs::write(path, &bytes).map_err(|e| format!("error: cannot write `{path}`: {e}"))
+        }
+        _ => {
+            let mut stdout = std::io::stdout();
+            if opts.emit == Emit::Obj && stdout.is_terminal() {
+                return Err(
+                    "error: refusing to write an object file to a terminal; use `-o FILE`"
+                        .to_string(),
+                );
             }
+            stdout
+                .write_all(&bytes)
+                .and_then(|()| stdout.flush())
+                .map_err(|e| format!("error: cannot write output: {e}"))
         }
-    };
-    let module = match loaded {
-        Ok(module) => module,
-        Err((code, msg)) => {
-            eprintln!("error[{code}]: {msg}");
+    }
+}
+
+fn main() -> ExitCode {
+    let opts = match parse_args() {
+        Ok(opts) => opts,
+        Err(msg) if msg.is_empty() => {
+            print!("{USAGE}");
+            return ExitCode::SUCCESS;
+        }
+        Err(msg) => {
+            eprintln!("error: {msg}\n\n{USAGE}");
             return ExitCode::FAILURE;
         }
     };
-    let verified = match module.verify() {
-        Ok(verified) => verified,
-        Err(report) => {
-            eprintln!("{report}");
-            return ExitCode::FAILURE;
-        }
-    };
-    match astronomy_nasm::compile(&verified) {
-        Ok(asm) => {
-            print!("{asm}");
-            ExitCode::SUCCESS
-        }
-        Err(e) => {
-            eprintln!("error[{}]: {e}", e.code());
+    match run(opts) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(msg) => {
+            eprintln!("{msg}");
             ExitCode::FAILURE
         }
     }

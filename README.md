@@ -202,7 +202,7 @@ astronomy/
 │   └── bin/astronomy.rs # small dev CLI (verify/fmt/inspect/encode)
 ├── examples/            # add, cfg, block_args, extern_decl
 ├── tests/               # acceptance, negative, roundtrip, binary suites
-└── astronomy-nasm/      # out-of-tree NASM (x86-64) native backend crate
+└── astronomy-nasm/      # out-of-tree x86-64 backend: ELF objects + NASM text
 ```
 
 ## Development CLI
@@ -242,9 +242,17 @@ MVP complete per the prototype definition of done:
 - [x] Deterministic printing (snapshot- and cache-friendly)
 - [x] `.arb` binary format: lossless, deterministic, checksummed roundtrip
 
-One out-of-tree backend ships in this repository: **`astronomy-nasm`** — a
-NASM (x86-64, System V AMD64) native backend that lowers verified modules to
-assembly text (see [`astronomy-nasm/README.md`](astronomy-nasm/README.md)).
+One out-of-tree backend ships in this repository: **`astronomy-nasm`** — an
+x86-64 (System V AMD64, Linux) native backend. It lowers verified modules
+**directly to ELF64 relocatable objects (`.o`) with its own machine-code
+encoder** — no assembler needed, just link with `cc`/`ld` — and can also
+print the same code as NASM assembly text (see
+[`astronomy-nasm/README.md`](astronomy-nasm/README.md)):
+
+```bash
+arn2nasm --emit obj hello.arn -o hello.o && cc main.c hello.o -o hello
+```
+
 It is a separate workspace member, so the core crate keeps zero backend code
 and zero backend dependencies.
 

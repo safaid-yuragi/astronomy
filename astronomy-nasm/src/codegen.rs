@@ -1,4 +1,4 @@
-//! NASM (x86-64 System V) code generation for verified Astronomy modules.
+//! x86-64 (System V) instruction selection for verified Astronomy modules.
 //!
 //! # Strategy
 //!
@@ -23,29 +23,68 @@
 //!   `rdi, rsi, rdx, rcx, r8, r9`, float arguments in `xmm0..xmm7`, the
 //!   rest on the stack; `%al` is set for variadic calls.
 //!
-//! Unsupported constructs (128-bit integers, aggregates passed/returned by
-//! value) produce structured [`BackendError`]s instead of wrong code.
+//! The output is a structured [`Program`] of [`Inst`]s, which
+//! [`crate::nasm`] prints as NASM text and [`crate::encode`] assembles into
+//! machine code. Unsupported constructs (128-bit integers, aggregates
+//! passed/returned by value) produce structured [`BackendError`]s instead
+//! of wrong code.
 
 use std::collections::HashMap;
-use std::fmt::Write as _;
 
 use astronomy::{
-    ConstantData, Function, Instruction, InstructionKind, Linkage, Module, Terminator, TypeData,
-    TypeId, ValueId, VerifiedModule,
+    ConstantData, Function, FunctionId, Instruction, InstructionKind, Linkage, Module, Terminator,
+    TypeData, TypeId, ValueId, VerifiedModule,
 };
 
+use crate::asm::{
+    AluOp, Cond, DataId, Fp, FuncCode, FuncSymbol, ImmStyle, Inst, Label, LabelKind, Mem, Program,
+    Reg, ShiftOp, SseOp, SymbolKind, Width, Xmm,
+};
 use crate::error::BackendError;
-use crate::layout::{self, align_up, align_of, is_aggregate, is_f32, is_float, size_of};
+use crate::layout::{self, align_of, align_up, is_aggregate, is_f32, is_float, size_of};
 
-/// Lowers a verified module to NASM source text.
-pub fn compile(module: &VerifiedModule) -> Result<String, BackendError> {
-    let mut generator = Generator {
-        module: module.module(),
-        out: String::new(),
-        rodata: Rodata::default(),
-    };
-    generator.run()?;
-    Ok(generator.finish())
+/// Lowers a verified module to machine instructions.
+pub fn lower(module: &VerifiedModule) -> Result<Program, BackendError> {
+    let module = module.module();
+    let mut rodata = Rodata::default();
+    let symbols = module
+        .functions()
+        .iter()
+        .map(|f| FuncSymbol {
+            name: module
+                .symbol_name(f.symbol)
+                .unwrap_or("<invalid>")
+                .to_string(),
+            kind: if f.is_declaration() {
+                SymbolKind::Extern
+            } else if matches!(f.linkage, Linkage::Internal) {
+                SymbolKind::Local
+            } else {
+                SymbolKind::Global
+            },
+        })
+        .collect();
+
+    let mut functions = Vec::new();
+    for (index, function) in module.functions().iter().enumerate() {
+        if function.is_declaration() {
+            continue;
+        }
+        let id = FunctionId::new(index as u32);
+        let mut func = FuncGen::new(module, function, &mut rodata);
+        func.build()?;
+        functions.push(FuncCode {
+            id,
+            labels: func.labels,
+            insts: func.insts,
+        });
+    }
+
+    Ok(Program {
+        symbols,
+        functions,
+        rodata: rodata.entries,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -54,97 +93,23 @@ pub fn compile(module: &VerifiedModule) -> Result<String, BackendError> {
 
 #[derive(Default)]
 struct Rodata {
-    entries: Vec<(String, Vec<u8>)>,
-    cache: HashMap<Vec<u8>, String>,
-    counter: usize,
+    entries: Vec<Vec<u8>>,
+    cache: HashMap<Vec<u8>, DataId>,
 }
 
 impl Rodata {
-    fn intern(&mut self, bytes: &[u8]) -> String {
-        if let Some(label) = self.cache.get(bytes) {
-            return label.clone();
+    fn intern(&mut self, bytes: &[u8]) -> DataId {
+        if let Some(&id) = self.cache.get(bytes) {
+            return id;
         }
-        let label = format!("arn.data.{}", self.counter);
-        self.counter += 1;
-        self.entries.push((label.clone(), bytes.to_vec()));
-        self.cache.insert(bytes.to_vec(), label.clone());
-        label
+        let id = DataId(self.entries.len() as u32);
+        self.entries.push(bytes.to_vec());
+        self.cache.insert(bytes.to_vec(), id);
+        id
     }
 
-    fn intern_f64(&mut self, value: f64) -> String {
+    fn intern_f64(&mut self, value: f64) -> DataId {
         self.intern(&value.to_bits().to_le_bytes())
-    }
-
-    fn emit(&self, out: &mut String) {
-        out.push_str("section .rodata\n");
-        for (label, bytes) in &self.entries {
-            let _ = writeln!(out, "{label}:");
-            if bytes.is_empty() {
-                out.push_str("    db 0\n");
-                continue;
-            }
-            for chunk in bytes.chunks(16) {
-                let parts: Vec<String> = chunk.iter().map(|b| format!("0x{b:02x}")).collect();
-                let _ = writeln!(out, "    db {}", parts.join(", "));
-            }
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Module-level driver
-// ---------------------------------------------------------------------------
-
-struct Generator<'a> {
-    module: &'a Module,
-    out: String,
-    rodata: Rodata,
-}
-
-impl Generator<'_> {
-    fn line(&mut self, text: &str) {
-        self.out.push_str(text);
-        self.out.push('\n');
-    }
-
-    fn run(&mut self) -> Result<(), BackendError> {
-        self.line("bits 64");
-        self.line("default rel");
-        self.line("");
-
-        let module = self.module;
-        for function in module.functions() {
-            let name = module
-                .symbol_name(function.symbol)
-                .unwrap_or("<invalid>")
-                .to_string();
-            if function.is_declaration() {
-                self.line(&format!("extern ${name}"));
-            } else if !matches!(function.linkage, Linkage::Internal) {
-                self.line(&format!("global ${name}"));
-            }
-        }
-        self.line("");
-        self.line("section .text");
-
-        for function in module.functions() {
-            if function.is_declaration() {
-                continue;
-            }
-            let mut func = FuncGen::new(module, function, &mut self.rodata);
-            func.build()?;
-            self.out.push_str(&func.out);
-        }
-
-        if !self.rodata.entries.is_empty() {
-            self.line("");
-            self.rodata.emit(&mut self.out);
-        }
-        Ok(())
-    }
-
-    fn finish(self) -> String {
-        self.out
     }
 }
 
@@ -152,11 +117,17 @@ impl Generator<'_> {
 // Per-function code generation
 // ---------------------------------------------------------------------------
 
+/// System V integer argument registers, in order.
+const GP_ARGS: [Reg; 6] = [Reg::Rdi, Reg::Rsi, Reg::Rdx, Reg::Rcx, Reg::R8, Reg::R9];
+
+const XMM0: Xmm = Xmm(0);
+const XMM1: Xmm = Xmm(1);
+
 /// Where a System V argument is passed.
 #[derive(Debug, Clone, Copy)]
 enum Loc {
     /// Integer/pointer register (System V order).
-    Int(&'static str),
+    Int(Reg),
     /// SSE register index (`xmmN`).
     Sse(u8),
     /// Stack slot at `[rsp + offset]`.
@@ -182,12 +153,18 @@ enum CmpOp {
     Ge,
 }
 
+/// Width of an integer access covering `bits` bits.
+fn width_of_bits(bits: u32) -> Width {
+    Width::from_bytes((bits as u64).div_ceil(8).max(1))
+}
+
 struct FuncGen<'a> {
     module: &'a Module,
     f: &'a Function,
     fname: String,
     rodata: &'a mut Rodata,
-    out: String,
+    insts: Vec<Inst>,
+    labels: Vec<(String, LabelKind)>,
     /// `disp[value.index()]` is the `rbp` displacement of the value's slot.
     disp: Vec<i32>,
     /// Displacement of each `alloca`'s storage, keyed by result value.
@@ -204,12 +181,17 @@ impl<'a> FuncGen<'a> {
             .symbol_name(f.symbol)
             .unwrap_or("<invalid>")
             .to_string();
+        // Labels 0..n are the blocks, so `Label(i)` is block `i`.
+        let labels = (0..f.blocks.len())
+            .map(|i| (format!("{fname}.bb{i}"), LabelKind::Block))
+            .collect();
         FuncGen {
             module,
             f,
             fname,
             rodata,
-            out: String::new(),
+            insts: Vec::new(),
+            labels,
             disp: Vec::new(),
             alloca: HashMap::new(),
             scratch: Vec::new(),
@@ -220,22 +202,26 @@ impl<'a> FuncGen<'a> {
 
     // -- small helpers ------------------------------------------------------
 
-    fn line(&mut self, text: &str) {
-        self.out.push_str(text);
-        self.out.push('\n');
+    fn emit(&mut self, inst: Inst) {
+        self.insts.push(inst);
     }
 
-    fn mem(&self, d: i32) -> String {
-        format!("[rbp{d:+}]")
+    fn slot(d: i32) -> Mem {
+        Mem::at(Reg::Rbp, d)
     }
 
-    fn tmp_label(&mut self, tag: &str) -> String {
+    fn tmp_label(&mut self, tag: &str) -> Label {
         self.tmp += 1;
-        format!("{}.{}{}", self.fname, tag, self.tmp)
+        let label = Label(self.labels.len() as u32);
+        self.labels.push((
+            format!("{}.{}{}", self.fname, tag, self.tmp),
+            LabelKind::Local,
+        ));
+        label
     }
 
-    fn block_label(&self, block: usize) -> String {
-        format!("{}.bb{}", self.fname, block)
+    fn block_label(block: usize) -> Label {
+        Label(block as u32)
     }
 
     fn ty_of(&self, v: ValueId) -> TypeId {
@@ -262,84 +248,79 @@ impl<'a> FuncGen<'a> {
         size_of(self.module.types(), ty)
     }
 
-    // -- emitting values ----------------------------------------------------
+    // -- moving values ------------------------------------------------------
 
-    fn load_int(&mut self, reg: &str, d: i32, bits: u32, signed: bool) {
-        let m = self.mem(d);
-        if bits == 64 {
-            self.line(&format!("    mov {reg}, qword {m}"));
-        } else if bits == 32 {
-            if signed {
-                self.line(&format!("    movsxd {reg}, dword {m}"));
-            } else {
-                let r = subreg(reg, 4);
-                self.line(&format!("    mov {r}, dword {m}"));
-            }
-        } else if bits == 16 {
-            if signed {
-                self.line(&format!("    movsx {reg}, word {m}"));
-            } else {
-                self.line(&format!("    movzx {reg}, word {m}"));
-            }
-        } else if signed && bits == 8 {
-            self.line(&format!("    movsx {reg}, byte {m}"));
-        } else {
-            self.line(&format!("    movzx {reg}, byte {m}"));
-        }
+    /// Loads an integer of `bits` from `mem` into the 64-bit `reg`,
+    /// sign- or zero-extending.
+    fn load_mem(&mut self, reg: Reg, mem: Mem, bits: u32, signed: bool) {
+        let inst = match bits {
+            64 => Inst::Load { dst: reg.q(), mem },
+            32 if !signed => Inst::Load {
+                dst: reg.at(Width::W32),
+                mem,
+            },
+            32 => Inst::LoadExt {
+                dst: reg,
+                src: Width::W32,
+                signed: true,
+                mem,
+            },
+            16 => Inst::LoadExt {
+                dst: reg,
+                src: Width::W16,
+                signed,
+                mem,
+            },
+            _ => Inst::LoadExt {
+                dst: reg,
+                src: Width::W8,
+                signed: signed && bits == 8,
+                mem,
+            },
+        };
+        self.emit(inst);
     }
 
-    fn store_int(&mut self, reg: &str, d: i32, bits: u32) {
-        let bytes = (bits as u64).div_ceil(8).max(1);
-        let r = subreg(reg, bytes);
-        let m = self.mem(d);
-        self.line(&format!("    mov {} {m}, {r}", size_kw(bytes)));
+    fn load_int(&mut self, reg: Reg, d: i32, bits: u32, signed: bool) {
+        self.load_mem(reg, Self::slot(d), bits, signed);
     }
 
-    fn load_float(&mut self, xmm: &str, d: i32, f32: bool) {
-        let m = self.mem(d);
-        if f32 {
-            self.line(&format!("    movss {xmm}, dword {m}"));
-        } else {
-            self.line(&format!("    movsd {xmm}, qword {m}"));
-        }
+    fn store_mem(&mut self, reg: Reg, mem: Mem, bits: u32) {
+        self.emit(Inst::Store {
+            mem,
+            src: reg.at(width_of_bits(bits)),
+        });
     }
 
-    fn store_float(&mut self, xmm: &str, d: i32, f32: bool) {
-        let m = self.mem(d);
-        if f32 {
-            self.line(&format!("    movss dword {m}, {xmm}"));
-        } else {
-            self.line(&format!("    movsd qword {m}, {xmm}"));
-        }
+    fn store_int(&mut self, reg: Reg, d: i32, bits: u32) {
+        self.store_mem(reg, Self::slot(d), bits);
     }
 
-    fn load_from_addr(&mut self, dst: &str, addr: &str, bits: u32, signed: bool) {
-        if bits == 64 {
-            self.line(&format!("    mov {dst}, qword [{addr}]"));
-        } else if bits == 32 {
-            if signed {
-                self.line(&format!("    movsxd {dst}, dword [{addr}]"));
-            } else {
-                let r = subreg(dst, 4);
-                self.line(&format!("    mov {r}, dword [{addr}]"));
-            }
-        } else if bits == 16 {
-            if signed {
-                self.line(&format!("    movsx {dst}, word [{addr}]"));
-            } else {
-                self.line(&format!("    movzx {dst}, word [{addr}]"));
-            }
-        } else if signed && bits == 8 {
-            self.line(&format!("    movsx {dst}, byte [{addr}]"));
-        } else {
-            self.line(&format!("    movzx {dst}, byte [{addr}]"));
-        }
+    fn load_float(&mut self, xmm: Xmm, d: i32, f32: bool) {
+        self.emit(Inst::FLoad {
+            fp: Fp::of(f32),
+            dst: xmm,
+            mem: Self::slot(d),
+        });
     }
 
-    fn store_to_addr(&mut self, addr: &str, value: &str, bits: u32) {
-        let bytes = (bits as u64).div_ceil(8).max(1);
-        let r = subreg(value, bytes);
-        self.line(&format!("    mov {} [{addr}], {r}", size_kw(bytes)));
+    fn store_float(&mut self, xmm: Xmm, d: i32, f32: bool) {
+        self.emit(Inst::FStore {
+            fp: Fp::of(f32),
+            mem: Self::slot(d),
+            src: xmm,
+        });
+    }
+
+    /// `rcx = count; rep movsb` with `rsi`/`rdi` already set up.
+    fn emit_byte_copy(&mut self, count: u64) {
+        self.emit(Inst::MovRI {
+            dst: Reg::Rcx.q(),
+            imm: count,
+            style: ImmStyle::Dec,
+        });
+        self.emit(Inst::Cld);
+        self.emit(Inst::RepMovsb);
     }
 
     /// Copies a whole value between two frame slots (bit-for-bit).
@@ -347,16 +328,19 @@ impl<'a> FuncGen<'a> {
         let agg = is_aggregate(self.module.types(), ty);
         let size = self.size(ty)?;
         if agg {
-            let (sm, dm) = (self.mem(src), self.mem(dst));
-            self.line(&format!("    lea rsi, {sm}"));
-            self.line(&format!("    lea rdi, {dm}"));
-            self.line(&format!("    mov rcx, {size}"));
-            self.line("    cld");
-            self.line("    rep movsb");
+            self.emit(Inst::Lea {
+                dst: Reg::Rsi,
+                mem: Self::slot(src),
+            });
+            self.emit(Inst::Lea {
+                dst: Reg::Rdi,
+                mem: Self::slot(dst),
+            });
+            self.emit_byte_copy(size);
         } else {
             let bits = (size * 8) as u32;
-            self.load_int("rax", src, bits, false);
-            self.store_int("rax", dst, bits);
+            self.load_int(Reg::Rax, src, bits, false);
+            self.store_int(Reg::Rax, dst, bits);
         }
         Ok(())
     }
@@ -385,11 +369,7 @@ impl<'a> FuncGen<'a> {
     fn build(&mut self) -> Result<(), BackendError> {
         let store = self.module.types();
         for (i, value) in self.f.values.iter().enumerate() {
-            layout::check_supported(
-                store,
-                value.ty,
-                &format!("value v{i} of `{}`", self.fname),
-            )?;
+            layout::check_supported(store, value.ty, &format!("value v{i} of `{}`", self.fname))?;
         }
 
         let mut used: u64 = 0;
@@ -430,8 +410,10 @@ impl<'a> FuncGen<'a> {
         for block in &self.f.blocks {
             for inst in &block.instructions {
                 if let InstructionKind::Call { args, .. } = &inst.kind {
-                    let types: Vec<TypeId> =
-                        args.iter().map(|a| self.f.value(*a).expect("value").ty).collect();
+                    let types: Vec<TypeId> = args
+                        .iter()
+                        .map(|a| self.f.value(*a).expect("value").ty)
+                        .collect();
                     let (_locs, bytes, _sse) = self.plan_types(&types, "call")?;
                     max_stack = max_stack.max(bytes);
                 }
@@ -466,7 +448,6 @@ impl<'a> FuncGen<'a> {
         types: &[TypeId],
         op: &'static str,
     ) -> Result<(Vec<Loc>, u64, usize), BackendError> {
-        const GP: [&str; 6] = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"];
         let mut gp = 0usize;
         let mut sse = 0usize;
         let mut stack = 0u64;
@@ -489,7 +470,7 @@ impl<'a> FuncGen<'a> {
                         &format!("`{op}` in `{}`", self.fname),
                     )?;
                     if gp < 6 {
-                        locs.push(Loc::Int(GP[gp]));
+                        locs.push(Loc::Int(GP_ARGS[gp]));
                         gp += 1;
                     } else {
                         locs.push(Loc::Stack(stack));
@@ -502,7 +483,11 @@ impl<'a> FuncGen<'a> {
                         op,
                         reason: format!(
                             "aggregate by-value {} is not supported (`{}`)",
-                            if op == "parameter" { "parameter" } else { "argument" },
+                            if op == "parameter" {
+                                "parameter"
+                            } else {
+                                "argument"
+                            },
                             astronomy::types::type_to_string(self.module.types(), ty)
                         ),
                     });
@@ -512,16 +497,31 @@ impl<'a> FuncGen<'a> {
         Ok((locs, stack, sse))
     }
 
+    /// Converts a stack-argument offset into a displacement.
+    fn stack_disp(&self, base: u64, off: u64, op: &'static str) -> Result<i32, BackendError> {
+        base.checked_add(off)
+            .and_then(|d| i32::try_from(d).ok())
+            .ok_or_else(|| BackendError::UnsupportedInstruction {
+                function: self.fname.clone(),
+                op,
+                reason: "stack arguments exceed the x86-64 signed 32-bit displacement limit".into(),
+            })
+    }
+
     // -- prologue / blocks --------------------------------------------------
 
     fn emit_prologue(&mut self) -> Result<(), BackendError> {
-        let label = self.fname.clone();
-        // `$` forces NASM to treat even register/directive names as symbols.
-        self.line(&format!("${label}:"));
-        self.line("    push rbp");
-        self.line("    mov rbp, rsp");
+        self.emit(Inst::Push(Reg::Rbp));
+        self.emit(Inst::MovRR {
+            dst: Reg::Rbp.q(),
+            src: Reg::Rsp.q(),
+        });
         if self.frame_size > 0 {
-            self.line(&format!("    sub rsp, {}", self.frame_size));
+            self.emit(Inst::AluRI {
+                op: AluOp::Sub,
+                dst: Reg::Rsp.q(),
+                imm: self.frame_size as i32,
+            });
         }
 
         let ptypes: Vec<TypeId> = self.f.params.iter().map(|p| p.ty).collect();
@@ -530,19 +530,23 @@ impl<'a> FuncGen<'a> {
             let value = self.f.params[i].value;
             let d = self.disp[value.index()];
             let ty = ptypes[i];
-            match loc {
+            match *loc {
                 Loc::Int(reg) => {
                     let (bits, _) = self.int_info(ty);
                     self.store_int(reg, d, bits);
                 }
                 Loc::Sse(n) => {
                     let f32 = is_f32(self.module.types(), ty);
-                    self.store_float(&format!("xmm{n}"), d, f32);
+                    self.store_float(Xmm(n), d, f32);
                 }
                 Loc::Stack(off) => {
                     let bytes = self.size(ty)?;
-                    self.line(&format!("mov rax, qword [rbp+{}]", 16 + off));
-                    self.store_int("rax", d, (bytes * 8) as u32);
+                    let at = self.stack_disp(16, off, "parameter")?;
+                    self.emit(Inst::Load {
+                        dst: Reg::Rax.q(),
+                        mem: Self::slot(at),
+                    });
+                    self.store_int(Reg::Rax, d, (bytes * 8) as u32);
                 }
             }
         }
@@ -550,10 +554,8 @@ impl<'a> FuncGen<'a> {
     }
 
     fn emit_block(&mut self, index: usize) -> Result<(), BackendError> {
-        let block = self.f.blocks[index].clone();
-        let label = self.block_label(index);
-        self.line("");
-        self.line(&format!("{label}:"));
+        let block = &self.f.blocks[index];
+        self.emit(Inst::Label(Self::block_label(index)));
         for inst in &block.instructions {
             self.gen_inst(inst)?;
         }
@@ -569,25 +571,16 @@ impl<'a> FuncGen<'a> {
         if args.is_empty() {
             return Ok(());
         }
-        let ptypes: Vec<TypeId> = self.f.blocks[target]
-            .params
-            .iter()
-            .map(|p| p.ty)
-            .collect();
-        let pdisps: Vec<i32> = self.f.blocks[target]
-            .params
-            .iter()
-            .map(|p| self.disp[p.value.index()])
-            .collect();
-        let scratch = self.scratch[target].clone();
-
+        let f = self.f;
+        let params = &f.blocks[target].params;
         // Parallel copy: stage every argument first, then commit.
         for (i, arg) in args.iter().enumerate() {
             let src = self.disp[arg.index()];
-            self.copy_slot(src, ptypes[i], scratch[i])?;
+            self.copy_slot(src, params[i].ty, self.scratch[target][i])?;
         }
-        for i in 0..args.len() {
-            self.copy_slot(scratch[i], ptypes[i], pdisps[i])?;
+        for (i, param) in params.iter().enumerate().take(args.len()) {
+            let dst = self.disp[param.value.index()];
+            self.copy_slot(self.scratch[target][i], param.ty, dst)?;
         }
         Ok(())
     }
@@ -596,8 +589,7 @@ impl<'a> FuncGen<'a> {
         match term {
             Terminator::Jump { target, args } => {
                 self.emit_edge(target.index(), args)?;
-                let label = self.block_label(target.index());
-                self.line(&format!("    jmp {label}"));
+                self.emit(Inst::Jmp(Self::block_label(target.index())));
             }
             Terminator::Branch {
                 condition,
@@ -607,17 +599,19 @@ impl<'a> FuncGen<'a> {
                 else_args,
             } => {
                 let cdisp = self.disp[condition.index()];
-                let m = self.mem(cdisp);
                 let else_label = self.tmp_label("else");
-                self.line(&format!("    cmp byte {m}, 0"));
-                self.line(&format!("    je {else_label}"));
+                self.emit(Inst::AluMI {
+                    op: AluOp::Cmp,
+                    width: Width::W8,
+                    mem: Self::slot(cdisp),
+                    imm: 0,
+                });
+                self.emit(Inst::Jcc(Cond::E, else_label));
                 self.emit_edge(then_block.index(), then_args)?;
-                let then_label = self.block_label(then_block.index());
-                self.line(&format!("    jmp {then_label}"));
-                self.line(&format!("{else_label}:"));
+                self.emit(Inst::Jmp(Self::block_label(then_block.index())));
+                self.emit(Inst::Label(else_label));
                 self.emit_edge(else_block.index(), else_args)?;
-                let else_label2 = self.block_label(else_block.index());
-                self.line(&format!("    jmp {else_label2}"));
+                self.emit(Inst::Jmp(Self::block_label(else_block.index())));
             }
             Terminator::Return { value } => {
                 if let Some(v) = value {
@@ -632,18 +626,16 @@ impl<'a> FuncGen<'a> {
                     }
                     if is_float(self.module.types(), ty) {
                         let f32 = is_f32(self.module.types(), ty);
-                        self.load_float("xmm0", d, f32);
+                        self.load_float(XMM0, d, f32);
                     } else {
                         let (bits, signed) = self.int_info(ty);
-                        self.load_int("rax", d, bits, signed);
+                        self.load_int(Reg::Rax, d, bits, signed);
                     }
                 }
-                self.line("    leave");
-                self.line("    ret");
+                self.emit(Inst::Leave);
+                self.emit(Inst::Ret);
             }
-            Terminator::Unreachable => {
-                self.line("    ud2");
-            }
+            Terminator::Unreachable => self.emit(Inst::Ud2),
         }
         Ok(())
     }
@@ -662,26 +654,22 @@ impl<'a> FuncGen<'a> {
         use InstructionKind as K;
         match &inst.kind {
             K::Const(cid) => {
-                let data = self
-                    .module
-                    .constants()
-                    .get(*cid)
-                    .cloned()
-                    .ok_or_else(|| BackendError::InvalidModule {
+                let data = self.module.constants().get(*cid).cloned().ok_or_else(|| {
+                    BackendError::InvalidModule {
                         reason: format!("unknown constant c{}", cid.as_u32()),
-                    })?;
-                let ty = self.ty_of(inst.result.expect("const result"));
+                    }
+                })?;
                 let dst = self.result_disp(inst)?;
-                self.materialize_const(&data, ty, dst)?;
+                self.materialize_const(&data, dst)?;
             }
             K::Add { lhs, rhs } => self.gen_arith(ArithOp::Add, *lhs, *rhs, inst)?,
             K::Sub { lhs, rhs } => self.gen_arith(ArithOp::Sub, *lhs, *rhs, inst)?,
             K::Mul { lhs, rhs } => self.gen_arith(ArithOp::Mul, *lhs, *rhs, inst)?,
             K::Div { lhs, rhs } => self.gen_div(*lhs, *rhs, inst, false)?,
             K::Rem { lhs, rhs } => self.gen_div(*lhs, *rhs, inst, true)?,
-            K::And { lhs, rhs } => self.gen_bitwise("and", *lhs, *rhs, inst)?,
-            K::Or { lhs, rhs } => self.gen_bitwise("or", *lhs, *rhs, inst)?,
-            K::Xor { lhs, rhs } => self.gen_bitwise("xor", *lhs, *rhs, inst)?,
+            K::And { lhs, rhs } => self.gen_bitwise(AluOp::And, *lhs, *rhs, inst)?,
+            K::Or { lhs, rhs } => self.gen_bitwise(AluOp::Or, *lhs, *rhs, inst)?,
+            K::Xor { lhs, rhs } => self.gen_bitwise(AluOp::Xor, *lhs, *rhs, inst)?,
             K::Shl { lhs, rhs } => self.gen_shift(*lhs, *rhs, inst, true)?,
             K::Shr { lhs, rhs } => self.gen_shift(*lhs, *rhs, inst, false)?,
             K::Eq { lhs, rhs } => self.gen_cmp(CmpOp::Eq, *lhs, *rhs, inst)?,
@@ -692,17 +680,17 @@ impl<'a> FuncGen<'a> {
             K::Ge { lhs, rhs } => self.gen_cmp(CmpOp::Ge, *lhs, *rhs, inst)?,
             K::Alloca { .. } => {
                 let result = inst.result.expect("alloca result");
-                let offset = self
-                    .alloca
-                    .get(&result.as_u32())
-                    .copied()
-                    .ok_or_else(|| BackendError::InvalidModule {
+                let offset = self.alloca.get(&result.as_u32()).copied().ok_or_else(|| {
+                    BackendError::InvalidModule {
                         reason: format!("alloca in `{}` has no storage", self.fname),
-                    })?;
-                let m = self.mem(offset);
-                self.line(&format!("    lea rax, {m}"));
+                    }
+                })?;
+                self.emit(Inst::Lea {
+                    dst: Reg::Rax,
+                    mem: Self::slot(offset),
+                });
                 let dst = self.disp[result.index()];
-                self.store_int("rax", dst, 64);
+                self.store_int(Reg::Rax, dst, 64);
             }
             K::Load { ty, pointer } => self.gen_load(*ty, *pointer, inst)?,
             K::Store { pointer, value } => self.gen_store(*pointer, *value)?,
@@ -712,27 +700,31 @@ impl<'a> FuncGen<'a> {
                 let to_bits = self.int_bits(*to);
                 let src = self.disp[value.index()];
                 let dst = self.result_disp(inst)?;
-                self.load_int("rax", src, from_bits, from_signed);
-                self.store_int("rax", dst, to_bits);
+                self.load_int(Reg::Rax, src, from_bits, from_signed);
+                self.store_int(Reg::Rax, dst, to_bits);
             }
             K::Trunc { to, value } => {
                 let from_bits = self.int_bits(self.ty_of(*value));
                 let to_bits = self.int_bits(*to);
                 let src = self.disp[value.index()];
                 let dst = self.result_disp(inst)?;
-                self.load_int("rax", src, from_bits, false);
+                self.load_int(Reg::Rax, src, from_bits, false);
                 if to_bits == 1 {
-                    self.line("    and eax, 1");
+                    self.emit(Inst::AluRI {
+                        op: AluOp::And,
+                        dst: Reg::Rax.at(Width::W32),
+                        imm: 1,
+                    });
                 }
-                self.store_int("rax", dst, to_bits);
+                self.store_int(Reg::Rax, dst, to_bits);
             }
             K::IntToFloat { to, value } => self.gen_int_to_float(*to, *value, inst)?,
             K::FloatToInt { to, value } => self.gen_float_to_int(*to, *value, inst)?,
             K::PtrCast { pointer, .. } => {
                 let src = self.disp[pointer.index()];
                 let dst = self.result_disp(inst)?;
-                self.load_int("rax", src, 64, false);
-                self.store_int("rax", dst, 64);
+                self.load_int(Reg::Rax, src, 64, false);
+                self.store_int(Reg::Rax, dst, 64);
             }
             K::Call { callee, args } => self.gen_call(*callee, args, inst)?,
             K::Construct { ty, fields } => self.gen_construct(*ty, fields, inst)?,
@@ -746,38 +738,51 @@ impl<'a> FuncGen<'a> {
         Ok(())
     }
 
-    fn materialize_const(
-        &mut self,
-        data: &ConstantData,
-        _ty: TypeId,
-        dst: i32,
-    ) -> Result<(), BackendError> {
+    fn materialize_const(&mut self, data: &ConstantData, dst: i32) -> Result<(), BackendError> {
         match data {
             ConstantData::Int { bits, width, .. } => {
-                self.line(&format!("    mov rax, 0x{:x}", *bits as u64));
-                self.store_int("rax", dst, *width);
+                self.emit(Inst::MovRI {
+                    dst: Reg::Rax.q(),
+                    imm: *bits as u64,
+                    style: ImmStyle::Hex,
+                });
+                self.store_int(Reg::Rax, dst, *width);
             }
             ConstantData::Float { ty: float_ty, bits } => {
                 if is_f32(self.module.types(), *float_ty) {
-                    self.line(&format!("    mov eax, 0x{:x}", *bits as u32));
-                    self.store_int("rax", dst, 32);
+                    self.emit(Inst::MovRI {
+                        dst: Reg::Rax.at(Width::W32),
+                        imm: *bits as u32 as u64,
+                        style: ImmStyle::Hex,
+                    });
+                    self.store_int(Reg::Rax, dst, 32);
                 } else {
-                    self.line(&format!("    mov rax, 0x{:x}", bits));
-                    self.store_int("rax", dst, 64);
+                    self.emit(Inst::MovRI {
+                        dst: Reg::Rax.q(),
+                        imm: *bits,
+                        style: ImmStyle::Hex,
+                    });
+                    self.store_int(Reg::Rax, dst, 64);
                 }
             }
             ConstantData::Null { .. } => {
-                self.line("    xor eax, eax");
-                self.store_int("rax", dst, 64);
+                self.zero(Reg::Rax);
+                self.store_int(Reg::Rax, dst, 64);
             }
             ConstantData::String { bytes } => {
                 let mut owned = bytes.clone();
                 owned.push(0);
-                let label = self.rodata.intern(&owned);
-                self.line(&format!("    lea rax, [rel {label}]"));
-                self.store_int("rax", dst, 64);
+                let id = self.rodata.intern(&owned);
+                self.emit(Inst::Lea {
+                    dst: Reg::Rax,
+                    mem: Mem::Data(id),
+                });
+                self.store_int(Reg::Rax, dst, 64);
             }
-            ConstantData::Aggregate { ty: agg_ty, elements } => {
+            ConstantData::Aggregate {
+                ty: agg_ty,
+                elements,
+            } => {
                 for (i, &element) in elements.iter().enumerate() {
                     let elem = self
                         .module
@@ -787,13 +792,37 @@ impl<'a> FuncGen<'a> {
                         .ok_or_else(|| BackendError::InvalidModule {
                             reason: format!("unknown aggregate element c{}", element.as_u32()),
                         })?;
-                    let fty = layout::field_type(self.module.types(), *agg_ty, i as u64)?;
+                    layout::field_type(self.module.types(), *agg_ty, i as u64)?;
                     let off = layout::field_offset(self.module.types(), *agg_ty, i as u64)?;
-                    self.materialize_const(&elem, fty, dst + off as i32)?;
+                    self.materialize_const(&elem, dst + off as i32)?;
                 }
             }
         }
         Ok(())
+    }
+
+    /// `xor r32, r32` — zeroes the full 64-bit register.
+    fn zero(&mut self, reg: Reg) {
+        let r = reg.at(Width::W32);
+        self.emit(Inst::AluRR {
+            op: AluOp::Xor,
+            dst: r,
+            src: r,
+        });
+    }
+
+    /// Loads both operands into `rax`/`rcx` (or `xmm0`/`xmm1`).
+    fn load_pair(&mut self, lhs: ValueId, rhs: ValueId, ty: TypeId) {
+        let (lsrc, rsrc) = (self.disp[lhs.index()], self.disp[rhs.index()]);
+        if is_float(self.module.types(), ty) {
+            let f32 = is_f32(self.module.types(), ty);
+            self.load_float(XMM0, lsrc, f32);
+            self.load_float(XMM1, rsrc, f32);
+        } else {
+            let (bits, signed) = self.int_info(ty);
+            self.load_int(Reg::Rax, lsrc, bits, signed);
+            self.load_int(Reg::Rcx, rsrc, bits, signed);
+        }
     }
 
     fn gen_arith(
@@ -805,49 +834,62 @@ impl<'a> FuncGen<'a> {
     ) -> Result<(), BackendError> {
         let ty = self.ty_of(lhs);
         let dst = self.result_disp(inst)?;
-        let (lsrc, rsrc) = (self.disp[lhs.index()], self.disp[rhs.index()]);
+        self.load_pair(lhs, rhs, ty);
         if is_float(self.module.types(), ty) {
             let f32 = is_f32(self.module.types(), ty);
-            let mnemonic = match op {
-                ArithOp::Add => "add",
-                ArithOp::Sub => "sub",
-                ArithOp::Mul => "mul",
+            let op = match op {
+                ArithOp::Add => SseOp::Add,
+                ArithOp::Sub => SseOp::Sub,
+                ArithOp::Mul => SseOp::Mul,
             };
-            let suffix = if f32 { "ss" } else { "sd" };
-            self.load_float("xmm0", lsrc, f32);
-            self.load_float("xmm1", rsrc, f32);
-            self.line(&format!("    {mnemonic}{suffix} xmm0, xmm1"));
-            self.store_float("xmm0", dst, f32);
+            self.emit(Inst::FArith {
+                op,
+                fp: Fp::of(f32),
+                dst: XMM0,
+                src: XMM1,
+            });
+            self.store_float(XMM0, dst, f32);
         } else {
-            let (bits, signed) = self.int_info(ty);
-            let mnemonic = match op {
-                ArithOp::Add => "add",
-                ArithOp::Sub => "sub",
-                ArithOp::Mul => "imul",
-            };
-            self.load_int("rax", lsrc, bits, signed);
-            self.load_int("rcx", rsrc, bits, signed);
-            self.line(&format!("    {mnemonic} rax, rcx"));
-            self.store_int("rax", dst, bits);
+            let (bits, _) = self.int_info(ty);
+            let (rax, rcx) = (Reg::Rax.q(), Reg::Rcx.q());
+            self.emit(match op {
+                ArithOp::Add => Inst::AluRR {
+                    op: AluOp::Add,
+                    dst: rax,
+                    src: rcx,
+                },
+                ArithOp::Sub => Inst::AluRR {
+                    op: AluOp::Sub,
+                    dst: rax,
+                    src: rcx,
+                },
+                ArithOp::Mul => Inst::ImulRR {
+                    dst: Reg::Rax,
+                    src: Reg::Rcx,
+                },
+            });
+            self.store_int(Reg::Rax, dst, bits);
         }
         Ok(())
     }
 
     fn gen_bitwise(
         &mut self,
-        mnemonic: &str,
+        op: AluOp,
         lhs: ValueId,
         rhs: ValueId,
         inst: &Instruction,
     ) -> Result<(), BackendError> {
         let ty = self.ty_of(lhs);
-        let (bits, signed) = self.int_info(ty);
-        let (lsrc, rsrc) = (self.disp[lhs.index()], self.disp[rhs.index()]);
+        let (bits, _) = self.int_info(ty);
         let dst = self.result_disp(inst)?;
-        self.load_int("rax", lsrc, bits, signed);
-        self.load_int("rcx", rsrc, bits, signed);
-        self.line(&format!("    {mnemonic} rax, rcx"));
-        self.store_int("rax", dst, bits);
+        self.load_pair(lhs, rhs, ty);
+        self.emit(Inst::AluRR {
+            op,
+            dst: Reg::Rax.q(),
+            src: Reg::Rcx.q(),
+        });
+        self.store_int(Reg::Rax, dst, bits);
         Ok(())
     }
 
@@ -860,47 +902,68 @@ impl<'a> FuncGen<'a> {
     ) -> Result<(), BackendError> {
         let ty = self.ty_of(lhs);
         let dst = self.result_disp(inst)?;
-        let (lsrc, rsrc) = (self.disp[lhs.index()], self.disp[rhs.index()]);
+        self.load_pair(lhs, rhs, ty);
         if is_float(self.module.types(), ty) {
             let f32 = is_f32(self.module.types(), ty);
-            let suffix = if f32 { "ss" } else { "sd" };
-            self.load_float("xmm0", lsrc, f32);
-            self.load_float("xmm1", rsrc, f32);
-            self.line(&format!("    div{suffix} xmm0, xmm1"));
-            self.store_float("xmm0", dst, f32);
+            self.emit(Inst::FArith {
+                op: SseOp::Div,
+                fp: Fp::of(f32),
+                dst: XMM0,
+                src: XMM1,
+            });
+            self.store_float(XMM0, dst, f32);
             return Ok(());
         }
         let (bits, signed) = self.int_info(ty);
-        self.load_int("rax", lsrc, bits, signed);
-        self.load_int("rcx", rsrc, bits, signed);
         if signed {
             // x86 IDIV traps on INT64_MIN / -1. Astronomy instead wraps
             // the quotient and defines the corresponding remainder as zero.
             let done = self.tmp_label("divdone");
             if bits == 64 {
                 let normal = self.tmp_label("divnormal");
-                self.line("    cmp rcx, -1");
-                self.line(&format!("    jne {normal}"));
-                self.line("    mov rdx, 0x8000000000000000");
-                self.line("    cmp rax, rdx");
-                self.line(&format!("    jne {normal}"));
-                self.line("    xor edx, edx");
-                self.line(&format!("    jmp {done}"));
-                self.line(&format!("{normal}:"));
+                self.emit(Inst::AluRI {
+                    op: AluOp::Cmp,
+                    dst: Reg::Rcx.q(),
+                    imm: -1,
+                });
+                self.emit(Inst::Jcc(Cond::Ne, normal));
+                self.emit(Inst::MovRI {
+                    dst: Reg::Rdx.q(),
+                    imm: 0x8000_0000_0000_0000,
+                    style: ImmStyle::Hex,
+                });
+                self.emit(Inst::AluRR {
+                    op: AluOp::Cmp,
+                    dst: Reg::Rax.q(),
+                    src: Reg::Rdx.q(),
+                });
+                self.emit(Inst::Jcc(Cond::Ne, normal));
+                self.zero(Reg::Rdx);
+                self.emit(Inst::Jmp(done));
+                self.emit(Inst::Label(normal));
             }
-            self.line("    cqo");
-            self.line("    idiv rcx");
+            self.emit(Inst::Cqo);
+            self.emit(Inst::Div {
+                signed: true,
+                src: Reg::Rcx,
+            });
             if bits == 64 {
-                self.line(&format!("{done}:"));
+                self.emit(Inst::Label(done));
             }
         } else {
-            self.line("    xor edx, edx");
-            self.line("    div rcx");
+            self.zero(Reg::Rdx);
+            self.emit(Inst::Div {
+                signed: false,
+                src: Reg::Rcx,
+            });
         }
         if is_rem {
-            self.line("    mov rax, rdx");
+            self.emit(Inst::MovRR {
+                dst: Reg::Rax.q(),
+                src: Reg::Rdx.q(),
+            });
         }
-        self.store_int("rax", dst, bits);
+        self.store_int(Reg::Rax, dst, bits);
         Ok(())
     }
 
@@ -915,29 +978,38 @@ impl<'a> FuncGen<'a> {
         let (bits, signed) = self.int_info(ty);
         let (lsrc, rsrc) = (self.disp[lhs.index()], self.disp[rhs.index()]);
         let dst = self.result_disp(inst)?;
-        self.load_int("rax", lsrc, bits, signed);
+        self.load_int(Reg::Rax, lsrc, bits, signed);
         let count_bits = self.int_bits(self.ty_of(rhs));
-        self.load_int("rcx", rsrc, count_bits, false);
+        self.load_int(Reg::Rcx, rsrc, count_bits, false);
         let special = self.tmp_label("shovf");
         let done = self.tmp_label("shdone");
-        self.line(&format!("    cmp rcx, {bits}"));
-        self.line(&format!("    jae {special}"));
-        if is_left {
-            self.line("    shl rax, cl");
+        self.emit(Inst::AluRI {
+            op: AluOp::Cmp,
+            dst: Reg::Rcx.q(),
+            imm: bits as i32,
+        });
+        self.emit(Inst::Jcc(Cond::Ae, special));
+        let op = if is_left {
+            ShiftOp::Shl
         } else if signed {
-            self.line("    sar rax, cl");
+            ShiftOp::Sar
         } else {
-            self.line("    shr rax, cl");
-        }
-        self.line(&format!("    jmp {done}"));
-        self.line(&format!("{special}:"));
+            ShiftOp::Shr
+        };
+        self.emit(Inst::ShiftCl { op, dst: Reg::Rax });
+        self.emit(Inst::Jmp(done));
+        self.emit(Inst::Label(special));
         if is_left || !signed {
-            self.line("    xor eax, eax");
+            self.zero(Reg::Rax);
         } else {
-            self.line("    sar rax, 63");
+            self.emit(Inst::ShiftRI {
+                op: ShiftOp::Sar,
+                dst: Reg::Rax,
+                imm: 63,
+            });
         }
-        self.line(&format!("{done}:"));
-        self.store_int("rax", dst, bits);
+        self.emit(Inst::Label(done));
+        self.store_int(Reg::Rax, dst, bits);
         Ok(())
     }
 
@@ -949,78 +1021,57 @@ impl<'a> FuncGen<'a> {
         inst: &Instruction,
     ) -> Result<(), BackendError> {
         let ty = self.ty_of(lhs);
-        let (lsrc, rsrc) = (self.disp[lhs.index()], self.disp[rhs.index()]);
         let dst = self.result_disp(inst)?;
+        self.load_pair(lhs, rhs, ty);
+        let setcc = |cond, dst| Inst::Setcc { cond, dst };
+        let (al, cl) = (Reg::Rax.at(Width::W8), Reg::Rcx.at(Width::W8));
         if is_float(self.module.types(), ty) {
             let f32 = is_f32(self.module.types(), ty);
-            let suffix = if f32 { "ss" } else { "sd" };
-            self.load_float("xmm0", lsrc, f32);
-            self.load_float("xmm1", rsrc, f32);
-            self.line(&format!("    ucomi{suffix} xmm0, xmm1"));
-            match op {
-                CmpOp::Eq => {
-                    self.line("    sete al");
-                    self.line("    setnp cl");
-                    self.line("    and al, cl");
-                }
-                CmpOp::Ne => {
-                    self.line("    setne al");
-                    self.line("    setp cl");
-                    self.line("    or al, cl");
-                }
-                CmpOp::Lt => {
-                    self.line("    setb al");
-                    self.line("    setnp cl");
-                    self.line("    and al, cl");
-                }
-                CmpOp::Le => {
-                    self.line("    setbe al");
-                    self.line("    setnp cl");
-                    self.line("    and al, cl");
-                }
-                CmpOp::Gt => self.line("    seta al"),
-                CmpOp::Ge => self.line("    setae al"),
+            self.emit(Inst::Ucomi {
+                fp: Fp::of(f32),
+                a: XMM0,
+                b: XMM1,
+            });
+            // ucomis* reports NaN operands as "unordered" through PF.
+            let (cond, parity) = match op {
+                CmpOp::Eq => (Cond::E, Some((Cond::Np, AluOp::And))),
+                CmpOp::Ne => (Cond::Ne, Some((Cond::P, AluOp::Or))),
+                CmpOp::Lt => (Cond::B, Some((Cond::Np, AluOp::And))),
+                CmpOp::Le => (Cond::Be, Some((Cond::Np, AluOp::And))),
+                CmpOp::Gt => (Cond::A, None),
+                CmpOp::Ge => (Cond::Ae, None),
+            };
+            self.emit(setcc(cond, Reg::Rax));
+            if let Some((pcond, combine)) = parity {
+                self.emit(setcc(pcond, Reg::Rcx));
+                self.emit(Inst::AluRR {
+                    op: combine,
+                    dst: al,
+                    src: cl,
+                });
             }
         } else {
-            let (bits, signed) = self.int_info(ty);
-            self.load_int("rax", lsrc, bits, signed);
-            self.load_int("rcx", rsrc, bits, signed);
-            self.line("    cmp rax, rcx");
-            let cc = match op {
-                CmpOp::Eq => "sete",
-                CmpOp::Ne => "setne",
-                CmpOp::Lt => {
-                    if signed {
-                        "setl"
-                    } else {
-                        "setb"
-                    }
-                }
-                CmpOp::Le => {
-                    if signed {
-                        "setle"
-                    } else {
-                        "setbe"
-                    }
-                }
-                CmpOp::Gt => {
-                    if signed {
-                        "setg"
-                    } else {
-                        "seta"
-                    }
-                }
-                CmpOp::Ge => {
-                    if signed {
-                        "setge"
-                    } else {
-                        "setae"
-                    }
-                }
+            let (_, signed) = self.int_info(ty);
+            self.emit(Inst::AluRR {
+                op: AluOp::Cmp,
+                dst: Reg::Rax.q(),
+                src: Reg::Rcx.q(),
+            });
+            let cond = match (op, signed) {
+                (CmpOp::Eq, _) => Cond::E,
+                (CmpOp::Ne, _) => Cond::Ne,
+                (CmpOp::Lt, true) => Cond::L,
+                (CmpOp::Lt, false) => Cond::B,
+                (CmpOp::Le, true) => Cond::Le,
+                (CmpOp::Le, false) => Cond::Be,
+                (CmpOp::Gt, true) => Cond::G,
+                (CmpOp::Gt, false) => Cond::A,
+                (CmpOp::Ge, true) => Cond::Ge,
+                (CmpOp::Ge, false) => Cond::Ae,
             };
-            self.line(&format!("    {cc} al"));
+            self.emit(setcc(cond, Reg::Rax));
         }
-        self.store_int("rax", dst, 8);
+        self.store_int(Reg::Rax, dst, 8);
         Ok(())
     }
 
@@ -1032,30 +1083,38 @@ impl<'a> FuncGen<'a> {
     ) -> Result<(), BackendError> {
         let psrc = self.disp[pointer.index()];
         let dst = self.result_disp(inst)?;
-        self.load_int("rax", psrc, 64, false);
+        self.load_int(Reg::Rax, psrc, 64, false);
+        let at_rax = Mem::at(Reg::Rax, 0);
         if is_aggregate(self.module.types(), ty) {
             let size = self.size(ty)?;
-            self.line("    mov rsi, rax");
-            let dm = self.mem(dst);
-            self.line(&format!("    lea rdi, {dm}"));
-            self.line(&format!("    mov rcx, {size}"));
-            self.line("    cld");
-            self.line("    rep movsb");
+            self.emit(Inst::MovRR {
+                dst: Reg::Rsi.q(),
+                src: Reg::Rax.q(),
+            });
+            self.emit(Inst::Lea {
+                dst: Reg::Rdi,
+                mem: Self::slot(dst),
+            });
+            self.emit_byte_copy(size);
         } else if is_float(self.module.types(), ty) {
             let f32 = is_f32(self.module.types(), ty);
-            if f32 {
-                self.line("    movss xmm0, dword [rax]");
-            } else {
-                self.line("    movsd xmm0, qword [rax]");
-            }
-            self.store_float("xmm0", dst, f32);
+            self.emit(Inst::FLoad {
+                fp: Fp::of(f32),
+                dst: XMM0,
+                mem: at_rax,
+            });
+            self.store_float(XMM0, dst, f32);
         } else {
             let (bits, signed) = self.int_info(ty);
-            self.load_from_addr("rdx", "rax", bits, signed);
+            self.load_mem(Reg::Rdx, at_rax, bits, signed);
             if bits == 1 {
-                self.line("    and edx, 1");
+                self.emit(Inst::AluRI {
+                    op: AluOp::And,
+                    dst: Reg::Rdx.at(Width::W32),
+                    imm: 1,
+                });
             }
-            self.store_int("rdx", dst, bits);
+            self.store_int(Reg::Rdx, dst, bits);
         }
         Ok(())
     }
@@ -1064,27 +1123,31 @@ impl<'a> FuncGen<'a> {
         let psrc = self.disp[pointer.index()];
         let vsrc = self.disp[value.index()];
         let ty = self.ty_of(value);
-        self.load_int("rax", psrc, 64, false);
+        self.load_int(Reg::Rax, psrc, 64, false);
+        let at_rax = Mem::at(Reg::Rax, 0);
         if is_aggregate(self.module.types(), ty) {
             let size = self.size(ty)?;
-            self.line("    mov rdi, rax");
-            let sm = self.mem(vsrc);
-            self.line(&format!("    lea rsi, {sm}"));
-            self.line(&format!("    mov rcx, {size}"));
-            self.line("    cld");
-            self.line("    rep movsb");
+            self.emit(Inst::MovRR {
+                dst: Reg::Rdi.q(),
+                src: Reg::Rax.q(),
+            });
+            self.emit(Inst::Lea {
+                dst: Reg::Rsi,
+                mem: Self::slot(vsrc),
+            });
+            self.emit_byte_copy(size);
         } else if is_float(self.module.types(), ty) {
             let f32 = is_f32(self.module.types(), ty);
-            self.load_float("xmm0", vsrc, f32);
-            if f32 {
-                self.line("    movss dword [rax], xmm0");
-            } else {
-                self.line("    movsd qword [rax], xmm0");
-            }
+            self.load_float(XMM0, vsrc, f32);
+            self.emit(Inst::FStore {
+                fp: Fp::of(f32),
+                mem: at_rax,
+                src: XMM0,
+            });
         } else {
             let (bits, signed) = self.int_info(ty);
-            self.load_int("rdx", vsrc, bits, signed);
-            self.store_to_addr("rax", "rdx", bits);
+            self.load_int(Reg::Rdx, vsrc, bits, signed);
+            self.store_mem(Reg::Rdx, at_rax, bits);
         }
         Ok(())
     }
@@ -1107,18 +1170,32 @@ impl<'a> FuncGen<'a> {
         let obits = self.int_bits(self.ty_of(offset));
         let (psrc, osrc) = (self.disp[pointer.index()], self.disp[offset.index()]);
         let dst = self.result_disp(inst)?;
-        self.load_int("rax", psrc, 64, false);
+        self.load_int(Reg::Rax, psrc, 64, false);
         // Offsets are signed bit patterns regardless of the IR type's signedness.
-        self.load_int("rcx", osrc, obits, true);
+        self.load_int(Reg::Rcx, osrc, obits, true);
         if elem_size <= i32::MAX as u64 {
-            self.line(&format!("    imul rcx, {elem_size}"));
+            self.emit(Inst::ImulRI {
+                dst: Reg::Rcx,
+                imm: elem_size as i32,
+            });
         } else {
             // IMUL's immediate is only a sign-extended 32-bit value.
-            self.line(&format!("    mov rdx, 0x{elem_size:x}"));
-            self.line("    imul rcx, rdx");
+            self.emit(Inst::MovRI {
+                dst: Reg::Rdx.q(),
+                imm: elem_size,
+                style: ImmStyle::Hex,
+            });
+            self.emit(Inst::ImulRR {
+                dst: Reg::Rcx,
+                src: Reg::Rdx,
+            });
         }
-        self.line("    add rax, rcx");
-        self.store_int("rax", dst, 64);
+        self.emit(Inst::AluRR {
+            op: AluOp::Add,
+            dst: Reg::Rax.q(),
+            src: Reg::Rcx.q(),
+        });
+        self.store_int(Reg::Rax, dst, 64);
         Ok(())
     }
 
@@ -1129,36 +1206,85 @@ impl<'a> FuncGen<'a> {
         inst: &Instruction,
     ) -> Result<(), BackendError> {
         let f32 = is_f32(self.module.types(), to);
-        let suffix = if f32 { "ss" } else { "sd" };
+        let fp = Fp::of(f32);
         let (from_bits, from_signed) = self.int_info(self.ty_of(value));
         let src = self.disp[value.index()];
         let dst = self.result_disp(inst)?;
-        if from_signed {
-            self.load_int("rax", src, from_bits, true);
-            self.line(&format!("    cvtsi2{suffix} xmm0, rax"));
-        } else if from_bits < 64 {
-            self.load_int("rax", src, from_bits, false);
-            self.line(&format!("    cvtsi2{suffix} xmm0, rax"));
+        let cvt = |src| Inst::CvtSi2F { fp, dst: XMM0, src };
+        if from_signed || from_bits < 64 {
+            self.load_int(Reg::Rax, src, from_bits, from_signed);
+            self.emit(cvt(Reg::Rax));
         } else {
-            // Unsigned 64-bit cannot use cvtsi2* directly.
+            // Unsigned 64-bit cannot use cvtsi2* directly: halve (keeping
+            // the low bit for correct rounding), convert, then double.
             let big = self.tmp_label("u2f");
             let done = self.tmp_label("u2fd");
-            self.load_int("rax", src, 64, false);
-            self.line("    test rax, rax");
-            self.line(&format!("    js {big}"));
-            self.line(&format!("    cvtsi2{suffix} xmm0, rax"));
-            self.line(&format!("    jmp {done}"));
-            self.line(&format!("{big}:"));
-            self.line("    mov rcx, rax");
-            self.line("    shr rcx, 1");
-            self.line("    and eax, 1");
-            self.line("    or rcx, rax");
-            self.line(&format!("    cvtsi2{suffix} xmm0, rcx"));
-            self.line(&format!("    add{suffix} xmm0, xmm0"));
-            self.line(&format!("{done}:"));
+            self.load_int(Reg::Rax, src, 64, false);
+            self.emit(Inst::Test {
+                a: Reg::Rax.q(),
+                b: Reg::Rax.q(),
+            });
+            self.emit(Inst::Jcc(Cond::S, big));
+            self.emit(cvt(Reg::Rax));
+            self.emit(Inst::Jmp(done));
+            self.emit(Inst::Label(big));
+            self.emit(Inst::MovRR {
+                dst: Reg::Rcx.q(),
+                src: Reg::Rax.q(),
+            });
+            self.emit(Inst::ShiftRI {
+                op: ShiftOp::Shr,
+                dst: Reg::Rcx,
+                imm: 1,
+            });
+            self.emit(Inst::AluRI {
+                op: AluOp::And,
+                dst: Reg::Rax.at(Width::W32),
+                imm: 1,
+            });
+            self.emit(Inst::AluRR {
+                op: AluOp::Or,
+                dst: Reg::Rcx.q(),
+                src: Reg::Rax.q(),
+            });
+            self.emit(cvt(Reg::Rcx));
+            self.emit(Inst::FArith {
+                op: SseOp::Add,
+                fp,
+                dst: XMM0,
+                src: XMM0,
+            });
+            self.emit(Inst::Label(done));
         }
-        self.store_float("xmm0", dst, f32);
+        self.store_float(XMM0, dst, f32);
         Ok(())
+    }
+
+    /// `ucomisd xmm0, xmm1` against a read-only `f64` bound.
+    fn compare_with_bound(&mut self, bound: f64) {
+        let id = self.rodata.intern_f64(bound);
+        self.compare_with_data(id);
+    }
+
+    fn compare_with_data(&mut self, id: DataId) {
+        self.emit(Inst::FLoad {
+            fp: Fp::Double,
+            dst: XMM1,
+            mem: Mem::Data(id),
+        });
+        self.emit(Inst::Ucomi {
+            fp: Fp::Double,
+            a: XMM0,
+            b: XMM1,
+        });
+    }
+
+    fn mov_rax_hex(&mut self, imm: u64) {
+        self.emit(Inst::MovRI {
+            dst: Reg::Rax.q(),
+            imm,
+            style: ImmStyle::Hex,
+        });
     }
 
     fn gen_float_to_int(
@@ -1171,98 +1297,113 @@ impl<'a> FuncGen<'a> {
         let (to_bits, to_signed) = self.int_info(to);
         let src = self.disp[value.index()];
         let dst = self.result_disp(inst)?;
+        let truncate = Inst::Cvttsd2si {
+            dst: Reg::Rax,
+            src: XMM0,
+        };
 
-        self.load_float("xmm0", src, from_f32);
+        self.load_float(XMM0, src, from_f32);
         if from_f32 {
-            self.line("    cvtss2sd xmm0, xmm0");
+            self.emit(Inst::Cvtss2sd {
+                dst: XMM0,
+                src: XMM0,
+            });
         }
 
         let zero = self.tmp_label("ftiz");
         let done = self.tmp_label("ftid");
         let sat_max = self.tmp_label("ftimax");
 
-        self.line("    ucomisd xmm0, xmm0");
-        self.line(&format!("    jp {zero}"));
+        self.emit(Inst::Ucomi {
+            fp: Fp::Double,
+            a: XMM0,
+            b: XMM0,
+        });
+        self.emit(Inst::Jcc(Cond::P, zero));
 
         if to_signed {
             let sat_min = self.tmp_label("ftimin");
-            let max_bound = (to_bits - 1) as i32;
-            let bound = 2f64.powi(max_bound);
-            let min_label = self.rodata.intern_f64(-bound);
-            let max_label = self.rodata.intern_f64(bound);
-            self.line(&format!("    movsd xmm1, qword [rel {max_label}]"));
-            self.line("    ucomisd xmm0, xmm1");
-            self.line(&format!("    jae {sat_max}"));
-            self.line(&format!("    movsd xmm1, qword [rel {min_label}]"));
-            self.line("    ucomisd xmm0, xmm1");
-            self.line(&format!("    jb {sat_min}"));
-            self.line("    cvttsd2si rax, xmm0");
-            self.line(&format!("    jmp {done}"));
-            self.line(&format!("{sat_max}:"));
+            let bound = 2f64.powi((to_bits - 1) as i32);
+            let min_id = self.rodata.intern_f64(-bound);
+            let max_id = self.rodata.intern_f64(bound);
+            self.compare_with_data(max_id);
+            self.emit(Inst::Jcc(Cond::Ae, sat_max));
+            self.compare_with_data(min_id);
+            self.emit(Inst::Jcc(Cond::B, sat_min));
+            self.emit(truncate.clone());
+            self.emit(Inst::Jmp(done));
+            self.emit(Inst::Label(sat_max));
             let max_value: u64 = if to_bits == 64 {
                 i64::MAX as u64
             } else {
                 (1u64 << (to_bits - 1)) - 1
             };
-            self.line(&format!("    mov rax, 0x{max_value:x}"));
-            self.line(&format!("    jmp {done}"));
-            self.line(&format!("{sat_min}:"));
-            let min_value: u64 = if to_bits == 64 {
-                1u64 << 63
-            } else {
-                1u64 << (to_bits - 1)
-            };
-            self.line(&format!("    mov rax, 0x{min_value:x}"));
-            self.line(&format!("    jmp {done}"));
+            self.mov_rax_hex(max_value);
+            self.emit(Inst::Jmp(done));
+            self.emit(Inst::Label(sat_min));
+            self.mov_rax_hex(1u64 << (to_bits - 1));
+            self.emit(Inst::Jmp(done));
         } else {
             // Reject negatives (`-0.5` truncates to `0`, and any x < 0
             // saturates to 0, so mapping every negative to 0 is correct).
-            self.line("    xorpd xmm1, xmm1");
-            self.line("    ucomisd xmm0, xmm1");
-            self.line(&format!("    jb {zero}"));
-            let bound = 2f64.powi(to_bits as i32);
-            let bound_label = self.rodata.intern_f64(bound);
-            self.line(&format!("    movsd xmm1, qword [rel {bound_label}]"));
-            self.line("    ucomisd xmm0, xmm1");
-            self.line(&format!("    jae {sat_max}"));
+            self.emit(Inst::Xorpd {
+                dst: XMM1,
+                src: XMM1,
+            });
+            self.emit(Inst::Ucomi {
+                fp: Fp::Double,
+                a: XMM0,
+                b: XMM1,
+            });
+            self.emit(Inst::Jcc(Cond::B, zero));
+            self.compare_with_bound(2f64.powi(to_bits as i32));
+            self.emit(Inst::Jcc(Cond::Ae, sat_max));
             if to_bits == 64 {
                 let small = self.tmp_label("ftismall");
-                let half = self.rodata.intern_f64(2f64.powi(63));
-                self.line(&format!("    movsd xmm1, qword [rel {half}]"));
-                self.line("    ucomisd xmm0, xmm1");
-                self.line(&format!("    jb {small}"));
-                self.line("    subsd xmm0, xmm1");
-                self.line("    cvttsd2si rax, xmm0");
-                self.line("    mov rcx, 0x8000000000000000");
-                self.line("    add rax, rcx");
-                self.line(&format!("    jmp {done}"));
-                self.line(&format!("{small}:"));
-                self.line("    cvttsd2si rax, xmm0");
-                self.line(&format!("    jmp {done}"));
-            } else {
-                self.line("    cvttsd2si rax, xmm0");
-                self.line(&format!("    jmp {done}"));
+                self.compare_with_bound(2f64.powi(63));
+                self.emit(Inst::Jcc(Cond::B, small));
+                self.emit(Inst::FArith {
+                    op: SseOp::Sub,
+                    fp: Fp::Double,
+                    dst: XMM0,
+                    src: XMM1,
+                });
+                self.emit(truncate.clone());
+                self.emit(Inst::MovRI {
+                    dst: Reg::Rcx.q(),
+                    imm: 0x8000_0000_0000_0000,
+                    style: ImmStyle::Hex,
+                });
+                self.emit(Inst::AluRR {
+                    op: AluOp::Add,
+                    dst: Reg::Rax.q(),
+                    src: Reg::Rcx.q(),
+                });
+                self.emit(Inst::Jmp(done));
+                self.emit(Inst::Label(small));
             }
-            self.line(&format!("{sat_max}:"));
+            self.emit(truncate);
+            self.emit(Inst::Jmp(done));
+            self.emit(Inst::Label(sat_max));
             let max_value: u64 = if to_bits == 64 {
                 u64::MAX
             } else {
                 (1u64 << to_bits) - 1
             };
-            self.line(&format!("    mov rax, 0x{max_value:x}"));
-            self.line(&format!("    jmp {done}"));
+            self.mov_rax_hex(max_value);
+            self.emit(Inst::Jmp(done));
         }
 
-        self.line(&format!("{zero}:"));
-        self.line("    xor eax, eax");
-        self.line(&format!("{done}:"));
-        self.store_int("rax", dst, to_bits);
+        self.emit(Inst::Label(zero));
+        self.zero(Reg::Rax);
+        self.emit(Inst::Label(done));
+        self.store_int(Reg::Rax, dst, to_bits);
         Ok(())
     }
 
     fn gen_call(
         &mut self,
-        callee: astronomy::FunctionId,
+        callee: FunctionId,
         args: &[ValueId],
         inst: &Instruction,
     ) -> Result<(), BackendError> {
@@ -1279,36 +1420,34 @@ impl<'a> FuncGen<'a> {
                 }
                 Loc::Sse(n) => {
                     let f32 = is_f32(self.module.types(), ty);
-                    self.load_float(&format!("xmm{n}"), src, f32);
+                    self.load_float(Xmm(n), src, f32);
                 }
                 Loc::Stack(off) => {
                     let bits = (self.size(ty)? * 8) as u32;
-                    self.load_int("rax", src, bits, false);
-                    self.line(&format!("    mov qword [rsp+{off}], rax"));
+                    self.load_int(Reg::Rax, src, bits, false);
+                    let at = self.stack_disp(0, off, "call")?;
+                    self.emit(Inst::Store {
+                        mem: Mem::at(Reg::Rsp, at),
+                        src: Reg::Rax.q(),
+                    });
                 }
             }
         }
 
-        let (callee_name, variadic) = {
-            let callee_fn =
-                self.module
-                    .function(callee)
-                    .ok_or_else(|| BackendError::InvalidModule {
-                        reason: format!("unknown callee f{}", callee.as_u32()),
-                    })?;
-            (
-                self.module
-                    .symbol_name(callee_fn.symbol)
-                    .unwrap_or("<invalid>")
-                    .to_string(),
-                callee_fn.variadic,
-            )
-        };
-
-        if variadic {
-            self.line(&format!("    mov al, {sse_used}"));
+        let callee_fn =
+            self.module
+                .function(callee)
+                .ok_or_else(|| BackendError::InvalidModule {
+                    reason: format!("unknown callee f{}", callee.as_u32()),
+                })?;
+        if callee_fn.variadic {
+            self.emit(Inst::MovRI {
+                dst: Reg::Rax.at(Width::W8),
+                imm: sse_used as u64,
+                style: ImmStyle::Dec,
+            });
         }
-        self.line(&format!("    call ${callee_name}"));
+        self.emit(Inst::Call(callee));
 
         if let Some(result) = inst.result {
             let rty = self.ty_of(result);
@@ -1322,10 +1461,10 @@ impl<'a> FuncGen<'a> {
             }
             if is_float(self.module.types(), rty) {
                 let f32 = is_f32(self.module.types(), rty);
-                self.store_float("xmm0", dst, f32);
+                self.store_float(XMM0, dst, f32);
             } else {
                 let (bits, _) = self.int_info(rty);
-                self.store_int("rax", dst, bits);
+                self.store_int(Reg::Rax, dst, bits);
             }
         }
         Ok(())
@@ -1377,61 +1516,5 @@ impl<'a> FuncGen<'a> {
         // Copy the whole aggregate, then overwrite the one field.
         self.copy_slot(adv, aty, dst)?;
         self.copy_slot(vd, fty, dst + off as i32)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Small textual helpers
-// ---------------------------------------------------------------------------
-
-fn size_kw(bytes: u64) -> &'static str {
-    match bytes {
-        1 => "byte",
-        2 => "word",
-        4 => "dword",
-        _ => "qword",
-    }
-}
-
-/// Maps a 64-bit register name to its 8/16/32-bit sub-register.
-fn subreg(name: &str, bytes: u64) -> String {
-    if let Some(rest) = name.strip_prefix('r') {
-        if let Ok(n) = rest.parse::<u32>() {
-            if (8..=15).contains(&n) {
-                return match bytes {
-                    1 => format!("r{n}b"),
-                    2 => format!("r{n}w"),
-                    4 => format!("r{n}d"),
-                    _ => name.to_string(),
-                };
-            }
-        }
-    }
-    match (name, bytes) {
-        ("rax", 1) => "al".to_string(),
-        ("rax", 2) => "ax".to_string(),
-        ("rax", 4) => "eax".to_string(),
-        ("rcx", 1) => "cl".to_string(),
-        ("rcx", 2) => "cx".to_string(),
-        ("rcx", 4) => "ecx".to_string(),
-        ("rdx", 1) => "dl".to_string(),
-        ("rdx", 2) => "dx".to_string(),
-        ("rdx", 4) => "edx".to_string(),
-        ("rbx", 1) => "bl".to_string(),
-        ("rbx", 2) => "bx".to_string(),
-        ("rbx", 4) => "ebx".to_string(),
-        ("rsi", 1) => "sil".to_string(),
-        ("rsi", 2) => "si".to_string(),
-        ("rsi", 4) => "esi".to_string(),
-        ("rdi", 1) => "dil".to_string(),
-        ("rdi", 2) => "di".to_string(),
-        ("rdi", 4) => "edi".to_string(),
-        ("rsp", 1) => "spl".to_string(),
-        ("rsp", 2) => "sp".to_string(),
-        ("rsp", 4) => "esp".to_string(),
-        ("rbp", 1) => "bpl".to_string(),
-        ("rbp", 2) => "bp".to_string(),
-        ("rbp", 4) => "ebp".to_string(),
-        _ => name.to_string(),
     }
 }

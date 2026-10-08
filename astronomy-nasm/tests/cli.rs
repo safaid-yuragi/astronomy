@@ -1,5 +1,6 @@
-//! End-to-end CLI test: `arn2nasm` loads `.arn`/`.arb`, verifies and emits NASM,
-//! exercising the same pipeline a user would drive from the shell.
+//! End-to-end CLI test: `arn2nasm` loads `.arn`/`.arb`, verifies and emits
+//! NASM text or an ELF object, exercising the same pipeline a user would
+//! drive from the shell.
 
 use std::process::Command;
 
@@ -101,4 +102,34 @@ fn cli_rejects_corrupt_arb() {
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("A-ARB-005"));
     let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn cli_emits_an_object_file_directly() {
+    let input = scratch("obj.arn");
+    let output = scratch("obj.o");
+    std::fs::write(&input, ADD_ARN).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_arn2nasm"))
+        .args(["--emit", "obj"])
+        .arg(&input)
+        .arg("-o")
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let bytes = std::fs::read(&output).unwrap();
+    assert_eq!(&bytes[..4], b"\x7fELF");
+    assert_eq!(u16::from_le_bytes([bytes[16], bytes[17]]), 1, "relocatable object");
+    let _ = std::fs::remove_file(&input);
+    let _ = std::fs::remove_file(&output);
+}
+
+#[test]
+fn cli_rejects_unknown_emit_kind() {
+    let out = Command::new(env!("CARGO_BIN_EXE_arn2nasm"))
+        .arg("--emit=exe")
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("unknown `--emit` kind"));
 }

@@ -2,12 +2,12 @@
 name = "astronomy-nasm"
 version = "0.1.0"
 edition = "2021"
-description = "Out-of-tree NASM (x86-64 System V) native backend for Astronomy IR"
+description = "Out-of-tree x86-64 (System V) native backend for Astronomy IR: ELF objects and NASM text"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 
 # Backends depend only on the core IR; this crate has no external
-# dependencies of its own (it emits NASM text and nothing else).
+# dependencies of its own (its encoder and ELF writer are built in).
 [dependencies]
 astronomy = { path = ".." }
 

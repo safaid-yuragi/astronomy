@@ -1,4 +1,4 @@
-//! Structured diagnostics for the NASM backend.
+//! Structured diagnostics for the x86-64 backend.
 //!
 //! The backend never returns `String` errors, mirroring the core crate's
 //! convention (`A-BUILD-*`, `A-VERIFY-*`, `A-ARN-*`): every failure carries a
@@ -6,7 +6,8 @@
 
 use std::fmt;
 
-/// A failure while lowering a verified module to NASM assembly.
+/// A failure while lowering a verified module to NASM assembly or an ELF
+/// object.
 #[allow(missing_docs)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BackendError {
@@ -42,6 +43,12 @@ pub enum BackendError {
         /// Human-readable reason.
         reason: String,
     },
+    /// The module cannot be represented in an ELF64 object file, e.g. a
+    /// symbol name containing NUL or more than 2 GiB of code (`A-NASM-005`).
+    ObjectLimit {
+        /// Human-readable reason.
+        reason: String,
+    },
 }
 
 impl BackendError {
@@ -52,6 +59,7 @@ impl BackendError {
             BackendError::UnsupportedInstruction { .. } => "A-NASM-002",
             BackendError::UnsupportedAbi { .. } => "A-NASM-003",
             BackendError::InvalidModule { .. } => "A-NASM-004",
+            BackendError::ObjectLimit { .. } => "A-NASM-005",
         }
     }
 }
@@ -84,6 +92,9 @@ impl fmt::Display for BackendError {
             ),
             BackendError::InvalidModule { reason } => {
                 write!(f, "[{}] invalid module: {reason}", self.code())
+            }
+            BackendError::ObjectLimit { reason } => {
+                write!(f, "[{}] cannot emit object file: {reason}", self.code())
             }
         }
     }

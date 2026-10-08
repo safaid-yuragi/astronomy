@@ -1,15 +1,24 @@
 //! # astronomy-nasm
 //!
-//! An out-of-tree **native backend** for [Astronomy IR](https://example.com):
-//! it lowers a [`VerifiedModule`](astronomy::VerifiedModule) to NASM
-//! (x86-64, System V AMD64) assembly text.
+//! An out-of-tree **native backend** for Astronomy IR targeting x86-64
+//! (System V AMD64, Linux). It lowers a
+//! [`VerifiedModule`] to
+//!
+//! * an **ELF64 relocatable object** with [`compile_object`], using the
+//!   crate's own machine-code encoder and ELF writer — no assembler is
+//!   involved; link the result with `cc`/`ld` like any compiler output; or
+//! * **NASM** assembly text with [`compile`].
 //!
 //! ```text
-//! Astronomy in-memory IR → Verifier → VerifiedModule ──▶ astronomy-nasm ──▶ .asm
+//! VerifiedModule ──▶ instruction selection ──┬──▶ encoder + ELF writer ──▶ .o
+//!                                            └──▶ NASM printer ──────────▶ .asm
 //! ```
 //!
-//! The backend accepts only verified IR (the type-level contract from the
-//! core crate), has no external dependencies, and emits deterministic text.
+//! Both outputs come from the same structured instruction stream and agree
+//! byte for byte: `nasm -f elf64` on the text yields exactly the `.text`
+//! and `.rodata` of [`compile_object`]'s output. The backend accepts only
+//! verified IR (the type-level contract from the core crate), has no
+//! external dependencies, and its output is deterministic.
 //!
 //! ## Example
 //!
@@ -32,6 +41,11 @@
 //! fb.ret(Some(sum))?;
 //!
 //! let verified = Verifier::verify(b.finish())?;
+//!
+//! // An object file, ready for `cc main.c demo.o`:
+//! std::fs::write("demo.o", astronomy_nasm::compile_object(&verified)?)?;
+//!
+//! // The same code as NASM text:
 //! let asm: String = astronomy_nasm::compile(&verified)?;
 //! assert!(asm.contains("add:"));
 //! # Ok(())
@@ -57,12 +71,37 @@
 //!   passed or returned by value; those cases return `A-NASM-002`.
 //! * Every IR `Abi` (`c`, `astronomy`, `system`, `custom`) maps to the
 //!   System V AMD64 convention; the `Abi` fact is not otherwise varied.
+//! * Modules that an ELF object cannot represent (a NUL byte in a symbol
+//!   name, more than 2 GiB of code) fail [`compile_object`] with
+//!   `A-NASM-005`.
 
 #![warn(missing_docs)]
 
+mod asm;
 mod codegen;
+mod elf;
+mod encode;
 mod error;
 mod layout;
+mod nasm;
 
-pub use codegen::compile;
+#[cfg(test)]
+mod nasm_crosscheck;
+
 pub use error::BackendError;
+
+use astronomy::VerifiedModule;
+
+/// Lowers a verified module to NASM (x86-64, System V AMD64) source text.
+pub fn compile(module: &VerifiedModule) -> Result<String, BackendError> {
+    codegen::lower(module).map(|program| nasm::print(&program))
+}
+
+/// Lowers a verified module straight to an ELF64 relocatable object
+/// (`.o`) for x86-64 Linux, using the built-in encoder — no assembler is
+/// involved. Link the result with `cc`/`ld` like any compiler output.
+pub fn compile_object(module: &VerifiedModule) -> Result<Vec<u8>, BackendError> {
+    let program = codegen::lower(module)?;
+    let text = encode::assemble(&program)?;
+    elf::write(&program, &text)
+}
