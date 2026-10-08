@@ -370,6 +370,32 @@ fn direct_construction_verifies() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn builder_handles_huge_arrays_without_allocating() {
+    // `array<i64, 2^40>`: construct/extract/insert must reason about the
+    // length instead of materializing one field type per element.
+    let mut b = ModuleBuilder::new();
+    let huge = b.array_type(TypeId::I64, 1 << 40);
+    let f = b
+        .declare_function("f", Linkage::Internal, Abi::Astronomy, &[("a", huge)], TypeId::I64)
+        .unwrap();
+    let mut fb = b.function_builder(f).unwrap();
+    fb.append_block();
+    let a = fb.param(0);
+    let x = fb.extract(a, u32::MAX).unwrap();
+    let _ = fb.insert(a, 7, x).unwrap();
+    let err = fb.construct(huge, &[x]).unwrap_err();
+    assert!(
+        err.to_string().contains("needs 1099511627776 field(s), found 1"),
+        "{err}"
+    );
+    fb.ret(Some(x)).unwrap();
+    drop(fb);
+    // Verify, print, re-parse and re-verify: every stage sees the huge type.
+    let verified = assert_roundtrip(b.finish());
+    assert!(verified.to_arn().contains("array<i64, 1099511627776>"));
+}
+
+#[test]
 fn builder_rejects_type_mismatch() {
     let mut b = ModuleBuilder::new();
     let f = b

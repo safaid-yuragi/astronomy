@@ -816,3 +816,21 @@ fn module_with_existing(mut module: Module, f: Function) -> Module {
     module.functions_mut().push(f);
     module
 }
+
+#[test]
+fn parser_checks_huge_array_constants_without_allocating() {
+    // `array<i64, 2^40>`: the parser must compare the element count against
+    // the length instead of materializing one expected type per element.
+    let src = concat!(
+        "::ASTRONOMY::MODULE_START\n",
+        "::ASTRONOMY::MODULE_VERSION 1\n",
+        "::ASTRONOMY::CONSTANTS_START\n",
+        "::ASTRONOMY::CONSTANT_INT c0 i64 1\n",
+        "::ASTRONOMY::CONSTANT_AGGREGATE c1 array<i64, 1099511627776> c0\n",
+        "::ASTRONOMY::CONSTANTS_END\n",
+        "::ASTRONOMY::MODULE_END\n"
+    );
+    let err = text::parse(src).unwrap_err();
+    assert_eq!(err.code(), "A-ARN-016", "{err}");
+    assert!(err.to_string().contains("needs 1099511627776 element(s), found 1"), "{err}");
+}
