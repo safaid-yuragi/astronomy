@@ -7,7 +7,7 @@ name = "astronomy"
 version = "0.1.0"
 
 [[package]]
-name = "astronomy-nasm"
+name = "astronomy-object"
 version = "0.1.0"
 dependencies = [
  "astronomy",

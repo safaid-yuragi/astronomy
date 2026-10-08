@@ -1,22 +1,23 @@
-//! # astronomy-nasm
+//! # astronomy-object
 //!
-//! An out-of-tree **native backend** for Astronomy IR targeting x86-64
-//! (System V AMD64, Linux). It lowers a
-//! [`VerifiedModule`] to
+//! Astronomy's own **native backend**: it compiles a [`VerifiedModule`] for
+//! x86-64 Linux (System V AMD64) **straight to an ELF64 relocatable object**
+//! (`.o`) with [`compile_object`]. Instruction selection, the machine-code
+//! encoder and the ELF writer are all part of this crate — no assembler or
+//! other external tool is involved; link the result with `cc`/`ld` like any
+//! compiler output.
 //!
-//! * an **ELF64 relocatable object** with [`compile_object`], using the
-//!   crate's own machine-code encoder and ELF writer — no assembler is
-//!   involved; link the result with `cc`/`ld` like any compiler output; or
-//! * **NASM** assembly text with [`compile`].
+//! For reading and debugging, [`compile_nasm`] renders the very same
+//! instructions as NASM source text.
 //!
 //! ```text
 //! VerifiedModule ──▶ instruction selection ──┬──▶ encoder + ELF writer ──▶ .o
 //!                                            └──▶ NASM printer ──────────▶ .asm
 //! ```
 //!
-//! Both outputs come from the same structured instruction stream and agree
-//! byte for byte: `nasm -f elf64` on the text yields exactly the `.text`
-//! and `.rodata` of [`compile_object`]'s output. The backend accepts only
+//! Both outputs come from one structured instruction stream and agree byte
+//! for byte: `nasm -f elf64` on the text yields exactly the `.text` and
+//! `.rodata` of [`compile_object`]'s output. The backend accepts only
 //! verified IR (the type-level contract from the core crate), has no
 //! external dependencies, and its output is deterministic.
 //!
@@ -43,10 +44,10 @@
 //! let verified = Verifier::verify(b.finish())?;
 //!
 //! // An object file, ready for `cc main.c demo.o`:
-//! std::fs::write("demo.o", astronomy_nasm::compile_object(&verified)?)?;
+//! std::fs::write("demo.o", astronomy_object::compile_object(&verified)?)?;
 //!
 //! // The same code as NASM text:
-//! let asm: String = astronomy_nasm::compile(&verified)?;
+//! let asm: String = astronomy_object::compile_nasm(&verified)?;
 //! assert!(asm.contains("add:"));
 //! # Ok(())
 //! # }
@@ -65,15 +66,15 @@
 //!
 //! ## Deliberate limits
 //!
-//! * `i128`/`u128` are rejected with `A-NASM-001` rather than lowered
+//! * `i128`/`u128` are rejected with `A-OBJ-001` rather than lowered
 //!   incorrectly.
 //! * Aggregates (structs/arrays) are supported as in-memory values but not
-//!   passed or returned by value; those cases return `A-NASM-002`.
+//!   passed or returned by value; those cases return `A-OBJ-002`.
 //! * Every IR `Abi` (`c`, `astronomy`, `system`, `custom`) maps to the
 //!   System V AMD64 convention; the `Abi` fact is not otherwise varied.
 //! * Modules that an ELF object cannot represent (a NUL byte in a symbol
 //!   name, more than 2 GiB of code) fail [`compile_object`] with
-//!   `A-NASM-005`.
+//!   `A-OBJ-005`.
 
 #![warn(missing_docs)]
 
@@ -92,16 +93,17 @@ pub use error::BackendError;
 
 use astronomy::VerifiedModule;
 
-/// Lowers a verified module to NASM (x86-64, System V AMD64) source text.
-pub fn compile(module: &VerifiedModule) -> Result<String, BackendError> {
-    codegen::lower(module).map(|program| nasm::print(&program))
-}
-
-/// Lowers a verified module straight to an ELF64 relocatable object
+/// Compiles a verified module straight to an ELF64 relocatable object
 /// (`.o`) for x86-64 Linux, using the built-in encoder — no assembler is
 /// involved. Link the result with `cc`/`ld` like any compiler output.
 pub fn compile_object(module: &VerifiedModule) -> Result<Vec<u8>, BackendError> {
     let program = codegen::lower(module)?;
     let text = encode::assemble(&program)?;
     elf::write(&program, &text)
+}
+
+/// Renders the code [`compile_object`] would produce as NASM (x86-64,
+/// System V AMD64) source text, for reading and debugging.
+pub fn compile_nasm(module: &VerifiedModule) -> Result<String, BackendError> {
+    codegen::lower(module).map(|program| nasm::print(&program))
 }

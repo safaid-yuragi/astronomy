@@ -21,5 +21,5 @@ path = "src/bin/astronomy.rs"
 # path; the core crate keeps zero backend-specific code and zero external
 # dependencies (§56 Dependency Policy, §17 Non-goals).
 [workspace]
-members = ["astronomy-nasm"]
+members = ["astronomy-object"]
 resolver = "2"

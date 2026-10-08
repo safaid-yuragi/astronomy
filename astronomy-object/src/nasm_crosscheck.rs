@@ -346,7 +346,7 @@ fn nasm_available() -> bool {
 
 /// Assembles `program`'s NASM text and returns NASM's `.text`.
 fn nasm_text(program: &Program, tag: &str) -> Vec<u8> {
-    let dir = std::env::temp_dir().join(format!("astronomy-nasm-{tag}-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("astronomy-object-{tag}-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let (asm_path, obj_path) = (dir.join("forms.asm"), dir.join("forms.o"));
     std::fs::write(&asm_path, crate::nasm::print(program)).unwrap();

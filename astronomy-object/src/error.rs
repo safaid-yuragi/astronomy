@@ -6,13 +6,13 @@
 
 use std::fmt;
 
-/// A failure while lowering a verified module to NASM assembly or an ELF
-/// object.
+/// A failure while compiling a verified module to an ELF object (or NASM
+/// text).
 #[allow(missing_docs)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BackendError {
     /// A type used by a value, parameter, result or pointee is not
-    /// representable by this backend (`A-NASM-001`).
+    /// representable by this backend (`A-OBJ-001`).
     UnsupportedType {
         /// Where the type was encountered (e.g. `parameter 0 of `f``).
         context: String,
@@ -21,7 +21,7 @@ pub enum BackendError {
         /// Human-readable reason.
         reason: String,
     },
-    /// An instruction or terminator cannot be lowered (`A-NASM-002`).
+    /// An instruction or terminator cannot be lowered (`A-OBJ-002`).
     UnsupportedInstruction {
         /// Function being lowered.
         function: String,
@@ -30,7 +30,7 @@ pub enum BackendError {
         /// Human-readable reason.
         reason: String,
     },
-    /// A function's ABI cannot be implemented (`A-NASM-003`).
+    /// A function's ABI cannot be implemented (`A-OBJ-003`).
     UnsupportedAbi {
         /// Function being lowered.
         function: String,
@@ -38,13 +38,13 @@ pub enum BackendError {
         abi: String,
     },
     /// The verified module is internally inconsistent in a way the backend
-    /// requires (should be unreachable for verified input) (`A-NASM-004`).
+    /// requires (should be unreachable for verified input) (`A-OBJ-004`).
     InvalidModule {
         /// Human-readable reason.
         reason: String,
     },
     /// The module cannot be represented in an ELF64 object file, e.g. a
-    /// symbol name containing NUL or more than 2 GiB of code (`A-NASM-005`).
+    /// symbol name containing NUL or more than 2 GiB of code (`A-OBJ-005`).
     ObjectLimit {
         /// Human-readable reason.
         reason: String,
@@ -52,14 +52,14 @@ pub enum BackendError {
 }
 
 impl BackendError {
-    /// Stable error code (e.g. `A-NASM-001`).
+    /// Stable error code (e.g. `A-OBJ-001`).
     pub fn code(&self) -> &'static str {
         match self {
-            BackendError::UnsupportedType { .. } => "A-NASM-001",
-            BackendError::UnsupportedInstruction { .. } => "A-NASM-002",
-            BackendError::UnsupportedAbi { .. } => "A-NASM-003",
-            BackendError::InvalidModule { .. } => "A-NASM-004",
-            BackendError::ObjectLimit { .. } => "A-NASM-005",
+            BackendError::UnsupportedType { .. } => "A-OBJ-001",
+            BackendError::UnsupportedInstruction { .. } => "A-OBJ-002",
+            BackendError::UnsupportedAbi { .. } => "A-OBJ-003",
+            BackendError::InvalidModule { .. } => "A-OBJ-004",
+            BackendError::ObjectLimit { .. } => "A-OBJ-005",
         }
     }
 }

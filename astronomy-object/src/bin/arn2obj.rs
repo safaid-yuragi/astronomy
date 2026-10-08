@@ -1,27 +1,29 @@
-//! `arn2nasm` — compile an Astronomy module for x86-64 Linux.
+//! `arn2obj` — compile an Astronomy module to an x86-64 Linux object file.
 //!
 //! ```text
-//! arn2nasm hello.arn > hello.asm              # NASM source
-//! arn2nasm --emit obj hello.arn -o hello.o    # ELF64 object, no assembler
-//! arn2nasm hello.arb > hello.asm
-//! arn2nasm < hello.arn
+//! arn2obj hello.arn                  # writes hello.o (like `cc -c`)
+//! arn2obj hello.arb -o out.o         # .arb input, explicit output
+//! arn2obj -o hello.o < hello.arn     # stdin input
+//! arn2obj --emit asm hello.arn       # NASM text of the same code, to stdout
 //! ```
 //!
 //! The input may be `.arn` text or `.arb` binary (detected by content). The
 //! pipeline is exactly the library pipeline: load → verify → lower, then
-//! either print NASM text or encode an object file with the built-in
-//! encoder. Anything invalid fails with a structured, coded error.
+//! encode an ELF object with the built-in encoder (or print NASM text).
+//! Anything invalid fails with a structured, coded error.
 
 use std::io::{IsTerminal, Read, Write};
 use std::process::ExitCode;
 
 const USAGE: &str = "\
-usage: arn2nasm [--emit asm|obj] [-o FILE] [FILE]
+usage: arn2obj [--emit obj|asm] [-o FILE] [FILE]
 
   FILE          .arn text or .arb binary (stdin when omitted)
-  --emit asm    NASM source text (default)
-  --emit obj    ELF64 relocatable object (.o), encoded directly
-  -o FILE       write the output to FILE instead of stdout
+  --emit obj    ELF64 relocatable object, encoded directly (default)
+  --emit asm    NASM source text of the same code
+  -o FILE       output file (`-` for stdout); by default an object goes to
+                FILE's name with a `.o` extension in the current directory
+                (stdout when reading stdin) and NASM text goes to stdout
 ";
 
 #[derive(PartialEq)]
@@ -38,7 +40,7 @@ struct Options {
 
 fn parse_args() -> Result<Options, String> {
     let mut opts = Options {
-        emit: Emit::Asm,
+        emit: Emit::Obj,
         input: None,
         output: None,
     };
@@ -94,12 +96,18 @@ fn run(opts: Options) -> Result<(), String> {
     let verified = module.verify().map_err(|report| report.to_string())?;
 
     let bytes = match opts.emit {
-        Emit::Asm => astronomy_nasm::compile(&verified).map(String::into_bytes),
-        Emit::Obj => astronomy_nasm::compile_object(&verified),
+        Emit::Asm => astronomy_object::compile_nasm(&verified).map(String::into_bytes),
+        Emit::Obj => astronomy_object::compile_object(&verified),
     }
     .map_err(|e| format!("error[{}]: {e}", e.code()))?;
 
-    match opts.output.as_deref() {
+    let output = opts
+        .output
+        .or_else(|| match (&opts.emit, opts.input.as_deref()) {
+            (Emit::Obj, Some(input)) if input != "-" => Some(default_object_name(input)),
+            _ => None,
+        });
+    match output.as_deref() {
         Some(path) if path != "-" => {
             std::fs::write(path, &bytes).map_err(|e| format!("error: cannot write `{path}`: {e}"))
         }
@@ -117,6 +125,16 @@ fn run(opts: Options) -> Result<(), String> {
                 .map_err(|e| format!("error: cannot write output: {e}"))
         }
     }
+}
+
+/// `dir/hello.arn` → `hello.o` (in the current directory, like `cc -c`).
+fn default_object_name(input: &str) -> String {
+    let stem = std::path::Path::new(input)
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "out".to_string());
+    format!("{stem}.o")
 }
 
 fn main() -> ExitCode {

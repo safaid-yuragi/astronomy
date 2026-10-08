@@ -1,22 +1,21 @@
-# astronomy-nasm
+# astronomy-object
 
-An **out-of-tree native backend** for [Astronomy IR](../README.md) targeting
-**x86-64, System V AMD64** (Linux/ELF64), with no external dependencies. It
-lowers a verified Astronomy module to
-
-* an **ELF64 relocatable object** (`.o`), encoded by the crate's own
-  machine-code encoder and ELF writer — no assembler involved; or
-* **NASM** assembly text for the very same instructions.
+**Astronomy's own native backend.** It compiles a verified
+[Astronomy IR](../README.md) module for **x86-64 Linux (System V AMD64)**
+straight to an **ELF64 relocatable object** (`.o`). Instruction selection,
+the machine-code encoder and the ELF writer all live in this crate, with no
+external dependencies — no assembler or other tool is involved. Link the
+result with `cc`/`ld` like any compiler output.
 
 ```text
-                                                   ┌─▶ encoder ─▶ ELF writer ─▶ .o ─▶ cc / ld
-VerifiedModule ─▶ instruction selection ─▶ x86-64 ─┤
-                                           insts   └─▶ NASM printer ─▶ .asm (optional)
+VerifiedModule ─▶ instruction selection ─▶ x86-64 insts ─┬─▶ encoder ─▶ ELF writer ─▶ .o ─▶ cc / ld
+                                                         └─▶ NASM printer ─▶ .asm   (for reading)
 ```
 
-Both outputs come from one structured instruction stream, and they agree
-byte for byte: assembling the text with `nasm -f elf64` yields exactly the
-`.text` and `.rodata` of the built-in object (the test suite checks this).
+For reading and debugging, the same instruction stream can also be printed
+as NASM source. The two agree byte for byte: assembling that text with
+`nasm -f elf64` yields exactly the `.text` and `.rodata` of the built-in
+object (the test suite checks this whenever NASM is installed).
 
 The core crate stays backend-free (§17 Non-goals, §56): this crate depends on
 `astronomy` by path and consumes only `&VerifiedModule`.
@@ -40,17 +39,19 @@ let sum = fb.add(a, c)?;
 fb.ret(Some(sum))?;
 
 let verified = Verifier::verify(b.finish())?;
-let object: Vec<u8> = astronomy_nasm::compile_object(&verified)?;  // ELF64 .o
+let object: Vec<u8> = astronomy_object::compile_object(&verified)?; // ELF64 .o
 std::fs::write("demo.o", &object)?;
-let asm: String = astronomy_nasm::compile(&verified)?;             // NASM text
+
+let asm: String = astronomy_object::compile_nasm(&verified)?;       // same code as text
 ```
 
 As a CLI (`.arn` or `.arb` input):
 
 ```bash
-arn2nasm --emit obj hello.arn -o hello.o   # ELF object, built-in encoder
-arn2nasm hello.arn > hello.asm             # NASM text (default)
-arn2nasm --emit obj -o hello.o < hello.arn # stdin works too
+arn2obj hello.arn                  # writes hello.o (like `cc -c`)
+arn2obj hello.arb -o out.o         # explicit output file
+arn2obj -o hello.o < hello.arn     # read stdin
+arn2obj --emit asm hello.arn       # NASM text to stdout
 ```
 
 Link the object like any compiler output — PIE (the default on most
@@ -60,9 +61,6 @@ distributions), non-PIE and shared libraries all work:
 cc main.c hello.o -o hello
 cc -shared hello.o -o libhello.so
 ```
-
-The NASM text remains available for reading and debugging; to assemble it
-yourself use `nasm -f elf64 hello.asm -o hello.o`.
 
 ## Design
 
@@ -139,24 +137,24 @@ Unsupported input fails with a structured error, never wrong code:
 
 | Code        | Meaning                                             |
 |-------------|-----------------------------------------------------|
-| `A-NASM-001`| `i128`/`u128` (or a type containing one) is rejected |
-| `A-NASM-002`| aggregates passed/returned by value are rejected     |
-| `A-NASM-003`| unsupported ABI                                      |
-| `A-NASM-004`| internal inconsistency (unreachable for verified IR) |
-| `A-NASM-005`| not representable in an ELF object (e.g. NUL in a symbol name, > 2 GiB of code) |
+| `A-OBJ-001` | `i128`/`u128` (or a type containing one) is rejected |
+| `A-OBJ-002` | aggregates passed/returned by value are rejected     |
+| `A-OBJ-003` | unsupported ABI                                      |
+| `A-OBJ-004` | internal inconsistency (unreachable for verified IR) |
+| `A-OBJ-005` | not representable in an ELF object (e.g. NUL in a symbol name, > 2 GiB of code) |
 
 Every IR `Abi` (`c`, `astronomy`, `system`, `custom`) currently maps to the
 System V convention.
 
 Invalid integer widths, overflowing type layouts and stack frames too large
-for signed 32-bit displacements also fail with `A-NASM-001`. An outgoing
-argument area that exceeds that frame limit fails with `A-NASM-002`.
+for signed 32-bit displacements also fail with `A-OBJ-001`. An outgoing
+argument area that exceeds that frame limit fails with `A-OBJ-002`.
 Pointers to large types remain usable for address arithmetic.
 
 ## Tests
 
 ```bash
-cargo test -p astronomy-nasm
+cargo test -p astronomy-object
 ```
 
 * `tests/run_integers.rs`, `run_widths.rs`, `run_floats.rs`,
@@ -177,7 +175,8 @@ cargo test -p astronomy-nasm
   into a shared library with `-z text`, and `readelf` acceptance.
 * `tests/codegen_text.rs` — emitted NASM directives, labels, determinism,
   error codes (no toolchain needed).
-* `tests/cli.rs` — the `arn2nasm` binary, including `--emit obj`.
+* `tests/cli.rs` — the `arn2obj` binary: object output and naming, stdin,
+  `--emit asm`, `.arb` input and error reporting.
 * Encoder unit tests (`src/encode.rs`) check individual encodings.
 
 **NASM as an independent reference.** NASM is never part of the pipeline,

@@ -1,4 +1,4 @@
-//! Shared helpers for the `astronomy-nasm` integration tests.
+//! Shared helpers for the `astronomy-object` integration tests.
 //!
 //! Tests build Astronomy IR in-memory and lower it with the backend. The
 //! execution helpers emit an ELF object with the **built-in encoder**, link
@@ -21,13 +21,13 @@ use astronomy::{Abi, FunctionBuilder, Linkage, Module, ModuleBuilder, TypeId, Ve
 /// Verifies and lowers a module, returning the NASM text.
 pub fn compile_ok(module: Module) -> String {
     let verified = Verifier::verify(module).expect("module must verify");
-    astronomy_nasm::compile(&verified).expect("module must lower to NASM")
+    astronomy_object::compile_nasm(&verified).expect("module must lower to NASM")
 }
 
 /// Verifies then lowers, expecting a backend error.
-pub fn compile_err(module: Module) -> astronomy_nasm::BackendError {
+pub fn compile_err(module: Module) -> astronomy_object::BackendError {
     let verified = Verifier::verify(module).expect("module must verify");
-    astronomy_nasm::compile(&verified).expect_err("expected a backend error")
+    astronomy_object::compile_nasm(&verified).expect_err("expected a backend error")
 }
 
 /// Builds a module with a single exported `abi=c` function.
@@ -82,7 +82,7 @@ pub fn temp_dir() -> PathBuf {
         .unwrap()
         .as_nanos();
     let dir =
-        std::env::temp_dir().join(format!("astronomy-nasm-{}-{n}-{nanos}", std::process::id()));
+        std::env::temp_dir().join(format!("astronomy-object-{}-{n}-{nanos}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
@@ -101,8 +101,8 @@ pub fn assemble_and_run(module: Module, driver: &str) -> Option<RunOutput> {
     }
 
     let verified = Verifier::verify(module).expect("module must verify");
-    let asm = astronomy_nasm::compile(&verified).expect("module must lower to NASM");
-    let object = astronomy_nasm::compile_object(&verified).expect("module must lower to ELF");
+    let asm = astronomy_object::compile_nasm(&verified).expect("module must lower to NASM");
+    let object = astronomy_object::compile_object(&verified).expect("module must lower to ELF");
 
     let dir = temp_dir();
     if nasm_available() {

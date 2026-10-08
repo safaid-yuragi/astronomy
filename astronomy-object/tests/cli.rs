@@ -1,5 +1,5 @@
-//! End-to-end CLI test: `arn2nasm` loads `.arn`/`.arb`, verifies and emits
-//! NASM text or an ELF object, exercising the same pipeline a user would
+//! End-to-end CLI test: `arn2obj` loads `.arn`/`.arb`, verifies and emits
+//! an ELF object (or NASM text), exercising the same pipeline a user would
 //! drive from the shell.
 
 use std::process::Command;
@@ -18,16 +18,17 @@ const ADD_ARN: &str = "\
 ";
 
 fn scratch(name: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("astronomy-nasm-cli-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("astronomy-object-cli-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     dir.join(name)
 }
 
 #[test]
-fn cli_transcompiles_a_file() {
+fn cli_prints_nasm_text() {
     let path = scratch("add.arn");
     std::fs::write(&path, ADD_ARN).unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_arn2nasm"))
+    let out = Command::new(env!("CARGO_BIN_EXE_arn2obj"))
+        .args(["--emit", "asm"])
         .arg(&path)
         .output()
         .unwrap();
@@ -43,7 +44,7 @@ fn cli_transcompiles_a_file() {
 fn cli_reads_stdin() {
     use std::io::Write;
     use std::process::Stdio;
-    let mut child = Command::new(env!("CARGO_BIN_EXE_arn2nasm"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_arn2obj"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -56,14 +57,15 @@ fn cli_reads_stdin() {
         .unwrap();
     let out = child.wait_with_output().unwrap();
     assert!(out.status.success());
-    assert!(String::from_utf8_lossy(&out.stdout).contains("add:"));
+    // Without `-o`, an object read from stdin goes to (piped) stdout.
+    assert!(out.stdout.starts_with(b"\x7fELF"), "expected an ELF object");
 }
 
 #[test]
 fn cli_rejects_invalid_arn() {
     let path = scratch("bad.arn");
     std::fs::write(&path, "::ASTRONOMY::MODULE_START\n::ASTRONOMY::BOGUS\n").unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_arn2nasm"))
+    let out = Command::new(env!("CARGO_BIN_EXE_arn2obj"))
         .arg(&path)
         .output()
         .unwrap();
@@ -77,7 +79,8 @@ fn cli_transcompiles_arb_binary() {
     let module = astronomy::Module::parse_arn(ADD_ARN).unwrap();
     let path = scratch("add.arb");
     std::fs::write(&path, module.to_arb()).unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_arn2nasm"))
+    let out = Command::new(env!("CARGO_BIN_EXE_arn2obj"))
+        .args(["--emit", "asm"])
         .arg(&path)
         .output()
         .unwrap();
@@ -95,7 +98,7 @@ fn cli_rejects_corrupt_arb() {
     bytes[mid] ^= 0xFF;
     let path = scratch("corrupt.arb");
     std::fs::write(&path, bytes).unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_arn2nasm"))
+    let out = Command::new(env!("CARGO_BIN_EXE_arn2obj"))
         .arg(&path)
         .output()
         .unwrap();
@@ -109,7 +112,7 @@ fn cli_emits_an_object_file_directly() {
     let input = scratch("obj.arn");
     let output = scratch("obj.o");
     std::fs::write(&input, ADD_ARN).unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_arn2nasm"))
+    let out = Command::new(env!("CARGO_BIN_EXE_arn2obj"))
         .args(["--emit", "obj"])
         .arg(&input)
         .arg("-o")
@@ -125,8 +128,28 @@ fn cli_emits_an_object_file_directly() {
 }
 
 #[test]
+fn cli_names_the_object_after_its_input() {
+    // Like `cc -c`: `dir/named.arn` becomes `named.o` in the current directory.
+    let input = scratch("named.arn");
+    std::fs::write(&input, ADD_ARN).unwrap();
+    let cwd = scratch("cwd");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_arn2obj"))
+        .arg(&input)
+        .current_dir(&cwd)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(out.stdout.is_empty());
+    let bytes = std::fs::read(cwd.join("named.o")).expect("named.o is written");
+    assert_eq!(&bytes[..4], b"\x7fELF");
+    let _ = std::fs::remove_dir_all(&cwd);
+    let _ = std::fs::remove_file(&input);
+}
+
+#[test]
 fn cli_rejects_unknown_emit_kind() {
-    let out = Command::new(env!("CARGO_BIN_EXE_arn2nasm"))
+    let out = Command::new(env!("CARGO_BIN_EXE_arn2obj"))
         .arg("--emit=exe")
         .output()
         .unwrap();

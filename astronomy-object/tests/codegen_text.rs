@@ -175,7 +175,7 @@ fn i128_is_rejected_with_a_structured_error() {
         fb.ret(Some(wide)).unwrap();
     });
     let err = compile_err(module);
-    assert_eq!(err.code(), "A-NASM-001");
+    assert_eq!(err.code(), "A-OBJ-001");
     assert!(err.to_string().contains("128-bit"), "{err}");
 }
 
@@ -192,7 +192,7 @@ fn aggregate_parameter_is_rejected() {
     let x = fb.extract(p, 0).unwrap();
     fb.ret(Some(x)).unwrap();
     let err = compile_err(b.finish());
-    assert_eq!(err.code(), "A-NASM-002");
+    assert_eq!(err.code(), "A-OBJ-002");
 }
 
 #[test]
@@ -208,7 +208,7 @@ fn aggregate_return_is_rejected() {
     let agg = fb.construct(pair, &[x, x]).unwrap();
     fb.ret(Some(agg)).unwrap();
     let err = compile_err(b.finish());
-    assert_eq!(err.code(), "A-NASM-002");
+    assert_eq!(err.code(), "A-OBJ-002");
 }
 
 #[test]
@@ -224,6 +224,6 @@ fn noncanonical_integer_widths_are_rejected() {
         let mut fb = builder.function_builder(id).unwrap();
         fb.append_block();
         fb.ret(Some(fb.param(0))).unwrap();
-        assert_eq!(compile_err(builder.finish()).code(), "A-NASM-001");
+        assert_eq!(compile_err(builder.finish()).code(), "A-OBJ-001");
     }
 }

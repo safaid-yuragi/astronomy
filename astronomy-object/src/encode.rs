@@ -13,7 +13,7 @@
 //!   (backward targets) or recorded in the previous pass (forward targets,
 //!   optimistically short while still unknown), until nothing moves. This
 //!   makes [`crate::compile_object`] byte-identical to `nasm -f elf64` on
-//!   [`crate::compile`]'s text. A final grow-only pass then guarantees every
+//!   [`crate::compile_nasm`]'s text. A final grow-only pass then guarantees every
 //!   short branch is in range regardless of how the passes ended.
 //! * Functions are laid out back to back. Calls between functions of the
 //!   module are resolved directly; calls to declarations and references to
@@ -1219,6 +1219,6 @@ mod tests {
             }],
             rodata: Vec::new(),
         };
-        assert_eq!(assemble(&program).unwrap_err().code(), "A-NASM-004");
+        assert_eq!(assemble(&program).unwrap_err().code(), "A-OBJ-004");
     }
 }
