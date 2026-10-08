@@ -731,3 +731,88 @@ fn malformed_inputs_never_panic() {
         let _ = text::parse(src);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Robustness against hostile (e.g. decoded `.arb`) modules
+// ---------------------------------------------------------------------------
+
+#[test]
+fn huge_array_aggregates_verify_without_allocating() {
+    // `array<i64, 2^40>`: materializing one entry per element would need
+    // terabytes; the verifier must reason about the length instead.
+    let mut module = Module::new();
+    let huge = module.types_mut().array(TypeId::I64, 1 << 40);
+    let sym = module.symbols_mut().intern("f");
+    let mut f = Function::new(
+        sym,
+        Linkage::Internal,
+        Abi::Astronomy,
+        vec![(None, huge)],
+        TypeId::I64,
+        false,
+    );
+    let arr = f.params[0].value;
+    let x = astronomy::ValueId::new(1);
+    let y = astronomy::ValueId::new(2);
+    for index in 0..2 {
+        f.values.push(ValueData::new(
+            if index == 0 { TypeId::I64 } else { huge },
+            ValueKind::Inst {
+                block: BlockId::new(0),
+                index,
+            },
+        ));
+    }
+    let mut bb = BasicBlock::new();
+    bb.instructions.push(Instruction::new(
+        InstructionKind::Extract {
+            aggregate: arr,
+            index: 7,
+        },
+        Some(x),
+    ));
+    bb.instructions.push(Instruction::new(
+        InstructionKind::Insert {
+            aggregate: arr,
+            index: u32::MAX,
+            value: x,
+        },
+        Some(y),
+    ));
+    bb.terminator = Some(Terminator::Return { value: Some(x) });
+    f.blocks.push(bb);
+    module.functions_mut().push(f);
+    // Valid: both indexes are within the array's 2^40 elements.
+    Verifier::verify(module).expect("in-range extract/insert must verify");
+}
+
+#[test]
+fn inconsistent_definition_block_does_not_panic() {
+    // A value claiming to be defined in a block that does not exist must be
+    // reported, not crash the dominance check.
+    let mut module = Module::new();
+    let mut f = named_function(&mut module, &[TypeId::I64], TypeId::I64);
+    let p = f.params[0].value;
+    let v = astronomy::ValueId::new(1);
+    f.values.push(ValueData::new(
+        TypeId::I64,
+        ValueKind::Inst {
+            block: BlockId::new(9),
+            index: u32::MAX,
+        },
+    ));
+    let mut bb = BasicBlock::new();
+    bb.instructions.push(Instruction::new(
+        InstructionKind::Add { lhs: p, rhs: p },
+        Some(v),
+    ));
+    bb.terminator = Some(Terminator::Return { value: Some(v) });
+    f.blocks.push(bb);
+    let report = Verifier::verify(module_with_existing(module, f)).unwrap_err();
+    assert!(!report.is_empty());
+}
+
+fn module_with_existing(mut module: Module, f: Function) -> Module {
+    module.functions_mut().push(f);
+    module
+}

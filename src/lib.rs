@@ -53,6 +53,7 @@
 //! * [`builder`] — the frontend-facing construction API.
 //! * [`verify`] — the verifier and [`VerifiedModule`].
 //! * [`text`] — the `.arn` parser and canonical printer.
+//! * [`binary`] — the `.arb` binary reader and writer.
 //!
 //! ## Dependencies
 //!
@@ -60,6 +61,7 @@
 
 #![warn(missing_docs)]
 
+pub mod binary;
 pub mod block;
 pub mod builder;
 pub mod constant;
@@ -83,7 +85,7 @@ pub mod text;
 pub use block::{BasicBlock, BlockParam, Terminator};
 pub use builder::{FunctionBuilder, ModuleBuilder};
 pub use constant::{ConstantData, ConstantStore};
-pub use error::{BuildError, ParseError, VerifyError, VerifyErrorReport};
+pub use error::{ArbError, BuildError, ParseError, VerifyError, VerifyErrorReport};
 pub use function::{Abi, Function, Linkage, Param};
 pub use id::{
     BlockId, ConstantId, FunctionId, GlobalId, MetadataId, SymbolId, TypeId, ValueId,

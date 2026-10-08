@@ -4,7 +4,7 @@ use std::fmt;
 use std::ops::Deref;
 
 use crate::constant::{ConstantData, ConstantStore};
-use crate::error::ParseError;
+use crate::error::{ArbError, ParseError};
 use crate::function::Function;
 use crate::id::{FunctionId, SymbolId, TypeId};
 use crate::symbol::SymbolStore;
@@ -196,6 +196,17 @@ impl Module {
     pub fn to_arn(&self) -> String {
         crate::text::print(self)
     }
+
+    /// Decodes `.arb` binary data into a module (§16). The result is not
+    /// verified.
+    pub fn from_arb(bytes: &[u8]) -> Result<Module, ArbError> {
+        crate::binary::read(bytes)
+    }
+
+    /// Serializes the module to `.arb` binary (§16).
+    pub fn to_arb(&self) -> Vec<u8> {
+        crate::binary::write(self)
+    }
 }
 
 impl Default for Module {
@@ -233,6 +244,11 @@ impl VerifiedModule {
     /// Re-serializes to canonical `.arn`.
     pub fn to_arn(&self) -> String {
         self.module.to_arn()
+    }
+
+    /// Serializes to `.arb` binary.
+    pub fn to_arb(&self) -> Vec<u8> {
+        self.module.to_arb()
     }
 }
 

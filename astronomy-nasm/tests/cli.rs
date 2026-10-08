@@ -1,4 +1,4 @@
-//! End-to-end CLI test: `arn2nasm` parses `.arn`, verifies and emits NASM,
+//! End-to-end CLI test: `arn2nasm` loads `.arn`/`.arb`, verifies and emits NASM,
 //! exercising the same pipeline a user would drive from the shell.
 
 use std::process::Command;
@@ -68,5 +68,37 @@ fn cli_rejects_invalid_arn() {
         .unwrap();
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("A-ARN"));
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn cli_transcompiles_arb_binary() {
+    let module = astronomy::Module::parse_arn(ADD_ARN).unwrap();
+    let path = scratch("add.arb");
+    std::fs::write(&path, module.to_arb()).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_arn2nasm"))
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let asm = String::from_utf8(out.stdout).unwrap();
+    assert!(asm.contains("global $add"), "{asm}");
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn cli_rejects_corrupt_arb() {
+    let module = astronomy::Module::parse_arn(ADD_ARN).unwrap();
+    let mut bytes = module.to_arb();
+    let mid = bytes.len() / 2;
+    bytes[mid] ^= 0xFF;
+    let path = scratch("corrupt.arb");
+    std::fs::write(&path, bytes).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_arn2nasm"))
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("A-ARB-005"));
     let _ = std::fs::remove_file(&path);
 }
