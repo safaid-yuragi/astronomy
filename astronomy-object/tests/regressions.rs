@@ -268,7 +268,7 @@ fn oversized_stack_frames_fail_with_a_structured_error() {
         fb.alloca(array).unwrap();
         fb.ret_void().unwrap();
         let error = compile_err(roundtrip(builder.finish()));
-        assert_eq!(error.code(), "A-NASM-001");
+        assert_eq!(error.code(), "A-X86-001");
     }
 }
 
@@ -285,5 +285,5 @@ fn overflowing_struct_layout_fails_with_a_structured_error() {
     fb.alloca(aggregate).unwrap();
     fb.ret_void().unwrap();
     let error = compile_err(roundtrip(builder.finish()));
-    assert_eq!(error.code(), "A-NASM-001");
+    assert_eq!(error.code(), "A-X86-001");
 }

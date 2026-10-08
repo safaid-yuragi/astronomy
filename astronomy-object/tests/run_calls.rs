@@ -336,9 +336,9 @@ fn void_function_with_no_frame() {
     fb.append_block();
     fb.ret_void().unwrap();
 
-    let asm = common::compile_ok(b.finish());
-    assert!(!asm.contains("sub rsp"), "{asm}");
-    assert!(asm.contains("    leave\n    ret"), "{asm}");
+    // push rbp; mov rbp, rsp; leave; ret — no `sub rsp` frame adjustment.
+    let text = common::text_of(b.finish());
+    assert_eq!(text, [0x55, 0x48, 0x89, 0xE5, 0xC9, 0xC3], "{text:02x?}");
     assert_prints(
         common::one_function("g", &[], TypeId::I32, |fb| {
             let zero = fb.const_int(TypeId::I32, 0).unwrap();

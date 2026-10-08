@@ -202,7 +202,9 @@ astronomy/
 │   └── bin/astronomy.rs # small dev CLI (verify/fmt/inspect/encode)
 ├── examples/            # add, cfg, block_args, extern_decl
 ├── tests/               # acceptance, negative, roundtrip, binary suites
-└── astronomy-nasm/      # out-of-tree NASM (x86-64) native backend crate
+├── astronomy-x86/       # shared x86-64 instruction selection
+├── astronomy-nasm/      # backend: NASM assembly text
+└── astronomy-object/    # backend: ELF64 objects via the built-in encoder
 ```
 
 ## Development CLI
@@ -242,11 +244,24 @@ MVP complete per the prototype definition of done:
 - [x] Deterministic printing (snapshot- and cache-friendly)
 - [x] `.arb` binary format: lossless, deterministic, checksummed roundtrip
 
-One out-of-tree backend ships in this repository: **`astronomy-nasm`** — a
-NASM (x86-64, System V AMD64) native backend that lowers verified modules to
-assembly text (see [`astronomy-nasm/README.md`](astronomy-nasm/README.md)).
-It is a separate workspace member, so the core crate keeps zero backend code
-and zero backend dependencies.
+Two out-of-tree backends for x86-64 Linux (System V AMD64) ship in this
+repository, as independent crates that share their instruction selection
+([`astronomy-x86`](astronomy-x86/README.md)):
+
+* **[`astronomy-object`](astronomy-object/README.md)** — Astronomy's own
+  backend: compiles verified modules **directly to ELF64 relocatable objects
+  (`.o`) with a built-in machine-code encoder and ELF writer**, no assembler
+  needed.
+* **[`astronomy-nasm`](astronomy-nasm/README.md)** — emits NASM assembly
+  text of the same code.
+
+```bash
+arn2obj hello.arn && cc main.c hello.o -o hello              # object, directly
+arn2nasm hello.arn > hello.asm && nasm -f elf64 hello.asm    # NASM text
+```
+
+They are separate workspace members, so the core crate keeps zero backend
+code and zero backend dependencies.
 
 Future work (by design, not yet implemented): optimizer passes, and further
 out-of-tree backends (`astronomy-c`, `astronomy-llvm`, …).

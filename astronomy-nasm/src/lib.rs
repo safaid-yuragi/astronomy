@@ -1,15 +1,17 @@
 //! # astronomy-nasm
 //!
-//! An out-of-tree **native backend** for [Astronomy IR](https://example.com):
-//! it lowers a [`VerifiedModule`](astronomy::VerifiedModule) to NASM
-//! (x86-64, System V AMD64) assembly text.
+//! A native backend for Astronomy IR that lowers a
+//! [`VerifiedModule`] to **NASM** assembly text for x86-64 (System V AMD64,
+//! Linux/ELF64).
 //!
 //! ```text
-//! Astronomy in-memory IR → Verifier → VerifiedModule ──▶ astronomy-nasm ──▶ .asm
+//! VerifiedModule ──▶ astronomy-x86 (instruction selection) ──▶ astronomy-nasm ──▶ .asm ──▶ nasm -f elf64
 //! ```
 //!
-//! The backend accepts only verified IR (the type-level contract from the
-//! core crate), has no external dependencies, and emits deterministic text.
+//! Instruction selection is shared with `astronomy-object`, Astronomy's own
+//! object-file backend, through `astronomy-x86`; this crate only prints.
+//! The backend accepts only verified IR, has no external dependencies, and
+//! its output is deterministic.
 //!
 //! ## Example
 //!
@@ -38,31 +40,24 @@
 //! # }
 //! ```
 //!
-//! ## Supported surface
-//!
-//! * All integer widths up to 64 bits (`i1`..`i64`, `u8`..`u64`), `f32`,
-//!   `f64`, pointers, arrays and structs.
-//! * Every instruction in the core instruction set, including
-//!   `alloca`/`load`/`store`/`ptr_offset`, conversions, calls,
-//!   `construct`/`extract`/`insert`, and all terminators with block
-//!   arguments.
-//! * The System V AMD64 calling convention, including variadic calls
-//!   (`%al` semantics).
-//!
-//! ## Deliberate limits
-//!
-//! * `i128`/`u128` are rejected with `A-NASM-001` rather than lowered
-//!   incorrectly.
-//! * Aggregates (structs/arrays) are supported as in-memory values but not
-//!   passed or returned by value; those cases return `A-NASM-002`.
-//! * Every IR `Abi` (`c`, `astronomy`, `system`, `custom`) maps to the
-//!   System V AMD64 convention; the `Abi` fact is not otherwise varied.
+//! Supported surface and limits are those of `astronomy-x86`; errors are
+//! its [`BackendError`] (`A-X86-*`).
 
 #![warn(missing_docs)]
 
-mod codegen;
-mod error;
-mod layout;
+mod printer;
 
-pub use codegen::compile;
-pub use error::BackendError;
+pub use astronomy_x86::BackendError;
+
+use astronomy::VerifiedModule;
+use astronomy_x86::asm::Program;
+
+/// Lowers a verified module to NASM (x86-64, System V AMD64) source text.
+pub fn compile(module: &VerifiedModule) -> Result<String, BackendError> {
+    astronomy_x86::lower(module).map(|program| print(&program))
+}
+
+/// Renders an already-lowered program as NASM source text.
+pub fn print(program: &Program) -> String {
+    printer::print(program)
+}

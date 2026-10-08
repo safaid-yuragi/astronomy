@@ -11,4 +11,21 @@ name = "astronomy-nasm"
 version = "0.1.0"
 dependencies = [
  "astronomy",
+ "astronomy-x86",
+]
+
+[[package]]
+name = "astronomy-object"
+version = "0.1.0"
+dependencies = [
+ "astronomy",
+ "astronomy-nasm",
+ "astronomy-x86",
+]
+
+[[package]]
+name = "astronomy-x86"
+version = "0.1.0"
+dependencies = [
+ "astronomy",
 ]

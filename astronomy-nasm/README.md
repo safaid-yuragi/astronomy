@@ -1,15 +1,22 @@
 # astronomy-nasm
 
-An **out-of-tree native backend** for [Astronomy IR](../README.md). It lowers
-a verified Astronomy module to **NASM** assembly for **x86-64, System V
-AMD64** (Linux/ELF64), with no external dependencies.
+A native backend for [Astronomy IR](../README.md) that lowers a verified
+module to **NASM** assembly text for **x86-64, System V AMD64**
+(Linux/ELF64), with no external dependencies.
 
 ```text
-Astronomy IR ──▶ Verifier ──▶ VerifiedModule ──▶ astronomy-nasm ──▶ .asm ──▶ nasm −f elf64
+VerifiedModule ──▶ astronomy-x86 (instruction selection) ──▶ astronomy-nasm ──▶ .asm ──▶ nasm -f elf64
 ```
 
+Instruction selection lives in [`astronomy-x86`](../astronomy-x86/README.md)
+and is shared with [`astronomy-object`](../astronomy-object/README.md),
+Astronomy's own backend that writes `.o` files directly without any
+assembler. This crate only prints; assembling its output with
+`nasm -f elf64` gives exactly the `.text` and `.rodata` that
+`astronomy-object` produces for the same module.
+
 The core crate stays backend-free (§17 Non-goals, §56): this crate depends on
-`astronomy` by path and consumes only `&VerifiedModule`.
+`astronomy` and `astronomy-x86` by path and consumes only `&VerifiedModule`.
 
 ## Usage
 
@@ -33,7 +40,10 @@ let verified = Verifier::verify(b.finish())?;
 let asm = astronomy_nasm::compile(&verified)?;   // NASM text
 ```
 
-As a CLI (`.arn` → NASM):
+`astronomy_nasm::print(&program)` renders an already-lowered
+`astronomy_x86::asm::Program`.
+
+As a CLI (`.arn` or `.arb` input):
 
 ```bash
 cargo run -p astronomy-nasm --bin arn2nasm -- hello.arn > hello.asm
@@ -47,70 +57,22 @@ nasm -f elf64 hello.asm -o hello.o
 gcc -no-pie driver.c hello.o -o hello
 ```
 
-## Design
+## Output
 
-Correctness first, not peak performance:
+* `bits 64` / `default rel`, `extern` for declarations and `global` for
+  exported/external definitions, in module order.
+* One label per function (`$name`, so even register or directive names are
+  valid symbols), block labels `name.bbN`, local labels for internal
+  branches.
+* `section .rodata` with string literals and float-conversion bounds
+  (`arn.data.N`).
+* Deterministic: the same module always produces byte-identical text.
 
-* **Everything lives in a stack slot.** Every SSA value — parameter, block
-  parameter or instruction result — gets an `rbp`-relative slot; instructions
-  load operands into registers, compute, and store the result back. There is
-  no register allocator, so lowering stays local and auditable.
-* **Blocks are labels; terminators are jumps.** `jump`/`branch` become
-  `jmp`/`je`; `return` becomes `leave; ret`; `unreachable` becomes `ud2`.
-* **Block arguments are parallel copies.** A jump stages all its argument
-  values into a per-block scratch area, then commits them to the target
-  block's parameter slots. The staging pass is what makes `jump bb(p1, p0)`
-  correct instead of clobbering a slot mid-copy.
-* **Fixed, aligned frame.** All slots are `rbp`-relative and `rsp` stays at a
-  16-byte boundary, with an outgoing stack-argument area reserved at the
-  bottom, so calls always see a properly aligned stack.
-* **System V AMD64 ABI** for every function: integer/pointer arguments in
-  `rdi, rsi, rdx, rcx, r8, r9`, float arguments in `xmm0..xmm7`, the rest on
-  the stack, returns in `rax`/`xmm0`, and `%al` set for variadic calls.
-* **Deterministic output** — the same module always produces byte-identical
-  assembly.
-
-## Supported surface
-
-* Types: `i1`, `i8`..`i64`, `u8`..`u64`, `f32`, `f64`, pointers, arrays,
-  structs (used as in-memory values).
-* Instructions: `const` (int, float, null, string, aggregate), `add`/`sub`/
-  `mul`/`div`/`rem`, `and`/`or`/`xor`/`shl`/`shr`, `eq`/`ne`/`lt`/`le`/`gt`/`ge`,
-  `alloca`/`load`/`store`/`ptr_offset`, `ext`/`trunc`/`int_to_float`/
-  `float_to_int`/`ptr_cast`, `call`, `construct`/`extract`/`insert`.
-* Terminators: `jump`, `branch`, `return`, `unreachable` — all with block
-  arguments.
-
-Semantics follow `SPECIFICATION.md`: wrapping integer arithmetic, truncating
-signed division, arithmetic vs logical `shr` by signedness, out-of-range shifts
-producing `0`/the sign bit, saturating `float_to_int` with `NaN → 0`, and
-IEEE-754 float comparisons that treat `NaN` as unordered.
-`INT_MIN / -1` wraps and its remainder is zero. Shift counts may use any
-supported integer type independently of the shifted value; `ptr_offset`
-interprets the offset as signed even when its IR type is unsigned.
-
-## Deliberate limits
-
-Unsupported input fails with a structured error, never wrong code:
-
-| Code        | Meaning                                             |
-|-------------|-----------------------------------------------------|
-| `A-NASM-001`| `i128`/`u128` (or a type containing one) is rejected |
-| `A-NASM-002`| aggregates passed/returned by value are rejected     |
-| `A-NASM-003`| unsupported ABI                                      |
-| `A-NASM-004`| internal inconsistency (unreachable for verified IR) |
-
-Every IR `Abi` (`c`, `astronomy`, `system`, `custom`) currently maps to the
-System V convention.
-
-Invalid integer widths, overflowing type layouts and stack frames too large
-for signed 32-bit displacements also fail with `A-NASM-001`. An outgoing
-argument area that exceeds that frame limit fails with `A-NASM-002`.
-Pointers to large types remain usable for address arithmetic.
+How IR is lowered (stack slots, block arguments, frame, ABI), the supported
+surface and the error codes (`A-X86-*`) are documented in
+[`astronomy-x86`](../astronomy-x86/README.md).
 
 ## Tests
-
-The suite is split between structural tests and real execution tests:
 
 ```bash
 cargo test -p astronomy-nasm
@@ -118,23 +80,14 @@ cargo test -p astronomy-nasm
 
 * `tests/codegen_text.rs` — emitted directives, labels, determinism, error
   codes (no toolchain needed).
-* `tests/run_integers.rs`, `run_widths.rs`, `run_floats.rs`,
-  `run_control_flow.rs`, `run_memory.rs`, `run_calls.rs` — each builds IR,
-  lowers it, **assembles with `nasm`, links with `gcc` and runs the
-  resulting program**, asserting on real output.
-* `tests/acceptance.rs` — full `.arn` round-trip then execution.
-* `tests/cli.rs` — the `arn2nasm` binary.
-* `tests/regressions.rs` — division overflow, mixed-width shifts, signed
-  pointer offsets, large strides, empty aggregates, NASM keyword symbols
-  and layout/frame overflow.
-* `tests/differential.rs` — all supported integer widths and operators,
-  mixed-width shifts, float/integer conversions checked against Rust casts,
-  and interleaved register/stack arguments. Numeric checks use boundary
-  values and deterministic random inputs through the ARN-to-executable pipeline.
+* `tests/acceptance.rs` — `.arn` round-trip, then assemble with `nasm`, link
+  with `gcc` and run.
+* `tests/cli.rs` — the `arn2nasm` binary, including `.arb` input.
 
 Execution tests skip themselves (with a message) when `nasm`/`gcc` are not
-installed. Ensure both tools are present when validating executable code;
-otherwise Cargo reports those early-returning tests as successful skips.
+installed. The full execution suites live in `astronomy-object`; whenever
+`nasm` is installed they also assemble this crate's text for every program
+and require it to match the object byte for byte.
 
 ## License
 
