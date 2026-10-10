@@ -511,22 +511,28 @@ impl Parser {
                     let _ = self.expect_fresh_constant_ref()?;
                     let ty = self.parse_type()?;
                     let line = self.line();
-                    let expected = aggregate_field_types(&self.module, ty).ok_or_else(|| {
-                        ParseError::InvalidType {
+                    if self.module.types().aggregate_fields(ty).is_none() {
+                        return Err(ParseError::InvalidType {
                             line,
                             reason: format!(
                                 "`{}` is not an aggregate type",
                                 self.module.type_name(ty)
                             ),
-                        }
-                    })?;
+                        });
+                    }
                     let mut elements = Vec::new();
                     while matches!(self.peek_kind(), Some(TokenKind::Ident(t))
                         if parse_cref(t).is_some())
                     {
                         elements.push(self.parse_constant_ref()?);
                     }
-                    if elements.len() != expected.len() {
+                    // A lazy view: array lengths may be astronomically large.
+                    let expected = self
+                        .module
+                        .types()
+                        .aggregate_fields(ty)
+                        .expect("checked to be an aggregate above");
+                    if elements.len() as u64 != expected.len() {
                         return Err(ParseError::InvalidStructure {
                             line,
                             reason: format!(
@@ -537,7 +543,8 @@ impl Parser {
                             ),
                         });
                     }
-                    for (i, (&cid, &field)) in elements.iter().zip(expected.iter()).enumerate() {
+                    for (i, &cid) in elements.iter().enumerate() {
+                        let field = expected.get(i as u64).expect("counts match");
                         let data = self.module.constants().get(cid).unwrap();
                         if !crate::error::constant_fits_type(self.module.types(), data, field) {
                             return Err(ParseError::InvalidStructure {
@@ -1573,15 +1580,6 @@ fn bin_op_of(op: &str) -> Option<BinOp> {
         "GE" => BinOp::Ge,
         _ => return None,
     })
-}
-
-fn aggregate_field_types(module: &Module, ty: TypeId) -> Option<Vec<TypeId>> {
-    use crate::types::TypeData;
-    match module.types().get(ty) {
-        Some(TypeData::Array { element, length }) => Some(vec![*element; *length as usize]),
-        Some(TypeData::Struct { fields }) => Some(fields.clone()),
-        _ => None,
-    }
 }
 
 fn parse_float_bits(raw: &str, is_f32: bool, line: u32) -> Result<u64, ParseError> {

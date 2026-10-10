@@ -247,6 +247,52 @@ impl TypeStore {
     }
 }
 
+/// Field types of an aggregate type, viewed without materializing array
+/// elements: an array's length is untrusted input and may be astronomically
+/// large (`array<i64, 2^40>` is a perfectly valid type), so code that only
+/// needs a count or one field's type must never allocate per element.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum AggregateFields<'a> {
+    /// `length` copies of `element`.
+    Array { element: TypeId, length: u64 },
+    /// The fields of a struct.
+    Struct(&'a [TypeId]),
+}
+
+impl AggregateFields<'_> {
+    /// Number of fields (elements for arrays).
+    pub(crate) fn len(&self) -> u64 {
+        match self {
+            AggregateFields::Array { length, .. } => *length,
+            AggregateFields::Struct(fields) => fields.len() as u64,
+        }
+    }
+
+    /// Type of field `index`, or `None` when out of range.
+    pub(crate) fn get(&self, index: u64) -> Option<TypeId> {
+        match self {
+            AggregateFields::Array { element, length } => (index < *length).then_some(*element),
+            AggregateFields::Struct(fields) => {
+                usize::try_from(index).ok().and_then(|i| fields.get(i).copied())
+            }
+        }
+    }
+}
+
+impl TypeStore {
+    /// The fields of `ty` if it is a struct or array type.
+    pub(crate) fn aggregate_fields(&self, ty: TypeId) -> Option<AggregateFields<'_>> {
+        match self.get(ty)? {
+            TypeData::Array { element, length } => Some(AggregateFields::Array {
+                element: *element,
+                length: *length,
+            }),
+            TypeData::Struct { fields } => Some(AggregateFields::Struct(fields)),
+            _ => None,
+        }
+    }
+}
+
 impl Default for TypeStore {
     fn default() -> Self {
         Self::new()

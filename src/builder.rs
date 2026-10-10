@@ -35,7 +35,7 @@ use crate::function::{Abi, Function, Linkage};
 use crate::id::{BlockId, ConstantId, FunctionId, SymbolId, TypeId, ValueId};
 use crate::instruction::{Instruction, InstructionKind};
 use crate::module::Module;
-use crate::types::TypeData;
+use crate::types::{AggregateFields, TypeData};
 use crate::value::{ValueData, ValueKind};
 use crate::Terminator;
 
@@ -1263,7 +1263,7 @@ impl<'m> FunctionBuilder<'m> {
     /// Constructs an aggregate value of type `ty`.
     pub fn construct(&mut self, ty: TypeId, fields: &[ValueId]) -> Result<ValueId, BuildError> {
         let field_tys = self.aggregate_fields(ty)?;
-        if field_tys.len() != fields.len() {
+        if field_tys.len() != fields.len() as u64 {
             return Err(BuildError::InvalidOperand {
                 context: "construct",
                 reason: format!(
@@ -1274,7 +1274,8 @@ impl<'m> FunctionBuilder<'m> {
                 ),
             });
         }
-        for (i, (&f, &expected)) in fields.iter().zip(field_tys.iter()).enumerate() {
+        for (i, &f) in fields.iter().enumerate() {
+            let expected = field_tys.get(i as u64).expect("counts match");
             let actual = self.ty_of(f)?;
             if actual != expected {
                 return Err(BuildError::TypeMismatch {
@@ -1297,23 +1298,24 @@ impl<'m> FunctionBuilder<'m> {
         })
     }
 
-    fn aggregate_fields(&self, ty: TypeId) -> Result<Vec<TypeId>, BuildError> {
-        match self.module.types.get(ty) {
-            Some(TypeData::Array { element, length }) => Ok(vec![*element; *length as usize]),
-            Some(TypeData::Struct { fields }) => Ok(fields.clone()),
-            _ => Err(BuildError::InvalidOperand {
+    /// A lazy view of `ty`'s fields: array lengths may be astronomically
+    /// large, so nothing is allocated per element.
+    fn aggregate_fields(&self, ty: TypeId) -> Result<AggregateFields<'_>, BuildError> {
+        self.module
+            .types
+            .aggregate_fields(ty)
+            .ok_or_else(|| BuildError::InvalidOperand {
                 context: "aggregate operation",
                 reason: format!("`{}` is not an aggregate type", self.type_name(ty)),
-            }),
-        }
+            })
     }
 
     /// Reads field `index` of an aggregate.
     pub fn extract(&mut self, aggregate: ValueId, index: u32) -> Result<ValueId, BuildError> {
         let aty = self.ty_of(aggregate)?;
         let fields = self.aggregate_fields(aty)?;
-        let field = *fields
-            .get(index as usize)
+        let field = fields
+            .get(u64::from(index))
             .ok_or_else(|| BuildError::InvalidOperand {
                 context: "extract",
                 reason: format!(
@@ -1340,8 +1342,8 @@ impl<'m> FunctionBuilder<'m> {
     ) -> Result<ValueId, BuildError> {
         let aty = self.ty_of(aggregate)?;
         let fields = self.aggregate_fields(aty)?;
-        let field = *fields
-            .get(index as usize)
+        let field = fields
+            .get(u64::from(index))
             .ok_or_else(|| BuildError::InvalidOperand {
                 context: "insert",
                 reason: format!(

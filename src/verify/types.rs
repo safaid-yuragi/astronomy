@@ -6,7 +6,7 @@ use crate::function::Function;
 use crate::id::TypeId;
 use crate::instruction::{Instruction, InstructionKind};
 use crate::module::Module;
-use crate::types::TypeData;
+use crate::types::{AggregateFields, TypeData};
 
 pub(crate) fn check_constant(
     module: &Module,
@@ -742,40 +742,8 @@ fn check_result(
     }
 }
 
-/// Field types of an aggregate, without materializing array elements: an
-/// array length is untrusted input and may be astronomically large.
-enum AggregateFields<'a> {
-    Array { element: TypeId, length: u64 },
-    Struct(&'a [TypeId]),
-}
-
-impl AggregateFields<'_> {
-    fn len(&self) -> u64 {
-        match self {
-            AggregateFields::Array { length, .. } => *length,
-            AggregateFields::Struct(fields) => fields.len() as u64,
-        }
-    }
-
-    fn get(&self, index: u64) -> Option<TypeId> {
-        match self {
-            AggregateFields::Array { element, length } => (index < *length).then_some(*element),
-            AggregateFields::Struct(fields) => {
-                usize::try_from(index).ok().and_then(|i| fields.get(i).copied())
-            }
-        }
-    }
-}
-
 fn aggregate_fields(module: &Module, ty: TypeId) -> Option<AggregateFields<'_>> {
-    match module.types().get(ty) {
-        Some(TypeData::Array { element, length }) => Some(AggregateFields::Array {
-            element: *element,
-            length: *length,
-        }),
-        Some(TypeData::Struct { fields }) => Some(AggregateFields::Struct(fields)),
-        _ => None,
-    }
+    module.types().aggregate_fields(ty)
 }
 
 fn check_call(
